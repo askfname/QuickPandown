@@ -16,6 +16,8 @@ _CHARS = "ACDEFGHJKLMNPQRTUVWXY34789"
 
 # 错误尝试也核销；{id: (answer, expires_at)}
 _store: dict[str, tuple[str, float]] = {}
+# 内存硬上限：验证码签发接口可被刷，超过后淘汰最早签发项
+MAX_ENTRIES = 4096
 
 
 def _monotonic() -> float:
@@ -36,6 +38,8 @@ def new_captcha() -> tuple[str, str, str]:
     cid = token_urlsafe(16)
     answer = "".join(random.choice(_CHARS) for _ in range(4))
     _store[cid] = (answer, _monotonic() + TTL_SECONDS)
+    while len(_store) > MAX_ENTRIES:
+        _store.pop(next(iter(_store)), None)
 
     rng = random.Random(cid)  # 以 id 为种子：同 id 渲染稳定，无需额外状态
     glyphs: list[str] = []

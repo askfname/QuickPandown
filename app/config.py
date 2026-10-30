@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Optional
@@ -14,6 +15,10 @@ def project_root() -> Path:
 
 
 DATA_DIR = project_root() / "data"
+
+# 本地文件保留上限（7 天）：与 tasks.json 历史保留期对齐；历史在文件到期
+# 后还会再保留一个周期，清扫器不会因历史先过期而失去文件记录
+MAX_RETENTION_MINUTES = 7 * 24 * 60
 
 
 @dataclass
@@ -32,15 +37,13 @@ class Settings:
     reserve_disk_mb: int = 1024
 
     def normalize(self) -> None:
-        """负数上限/预留空间按不限制或关闭守门处理。
-
-        保留期不做改写兜底（系统已重新部署、无 0 旧数据；保存链路与
-        API 校验强制 ≥1），拿到什么用什么
-        """
+        """负数上限/预留空间按不限制或关闭守门处理；保留期封顶历史保留期。"""
         if self.max_download_mb < 0:
             self.max_download_mb = 0
         if self.reserve_disk_mb < 0:
             self.reserve_disk_mb = 0
+        if self.retention_minutes > MAX_RETENTION_MINUTES:
+            self.retention_minutes = MAX_RETENTION_MINUTES
 
 
 def _settings_path() -> Path:
@@ -63,8 +66,16 @@ def _read_json(path: Path) -> Optional[dict]:
 
 def _write_json(path: Path, payload: dict) -> None:
     _ensure_data_dir()
-    with path.open("w", encoding="utf-8") as fh:
-        json.dump(payload, fh, ensure_ascii=False, indent=2)
+    tmp = path.with_name(f".{path.name}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
 
 
 def _matches_type(value: Any, expected: type) -> bool:

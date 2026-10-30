@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 import uuid
@@ -34,13 +35,22 @@ COMMON_EMAIL_DOMAINS = frozenset({
 # 登录限速：连续失败 5 次后，第 n 次失败延迟 min(2^(n-5), 900) 秒
 FAIL_THRESHOLD = 5
 FAIL_DELAY_CAP = 900
-# 内存计数：{("u", 用户名): [失败次数, 首次失败时间]} 与 {("i", ip): ...}
+# 内存计数：{("u", 用户名): [失败次数, 锁定到期时刻]} 与 {("i", ip): ...}
 _fail_counts: dict[tuple[str, str], list] = {}
 
 # 注册/登录接口每 IP 每分钟 10 次
 RATE_WINDOW = 60.0
 RATE_MAX = 10
 _rate_window: dict[str, list[float]] = {}
+
+# 内存表硬上限：唯一用户名/IP 的爆破流量不能无限占用进程内存
+MAX_TRACKED_KEYS = 4096
+
+
+def _trim_oldest(table: dict, limit: int = MAX_TRACKED_KEYS) -> None:
+    """超过上限时丢最早插入的键（dict 保持插入序，O(溢出数)）"""
+    while len(table) > limit:
+        table.pop(next(iter(table)), None)
 
 
 class AuthError(Exception):
@@ -54,8 +64,10 @@ class AuthError(Exception):
 
 def reset_rate_limits() -> None:
     """测试辅助：清空限速状态"""
+    global _last_purge
     _fail_counts.clear()
     _rate_window.clear()
+    _last_purge = 0.0
 
 
 def hash_password(password: str) -> str:
@@ -67,6 +79,15 @@ def verify_password(password: str, password_hash: str) -> bool:
         return _hasher.verify(password_hash, password)
     except VerifyMismatchError:
         return False
+
+
+# Argon2 是 CPU 密集同步计算（几十到几百毫秒）：放线程池，避免阻塞事件循环
+async def hash_password_async(password: str) -> str:
+    return await asyncio.to_thread(hash_password, password)
+
+
+async def verify_password_async(password: str, password_hash: str) -> bool:
+    return await asyncio.to_thread(verify_password, password, password_hash)
 
 
 def validate_register(username: str, email: str, password: str, invite_code: str) -> str | None:
@@ -94,6 +115,12 @@ def _check_rate(ip: str) -> None:
         raise AuthError("请求过于频繁，请稍后再试", retry_after=int(RATE_WINDOW - (now - hits[0])) + 1)
     hits.append(now)
     _rate_window[ip] = hits
+    if len(_rate_window) > MAX_TRACKED_KEYS:
+        # 先清过期窗口，再按最旧键淘汰；只在超限时触发，常态零成本
+        for key in [k for k, v in _rate_window.items() if not v or now - v[-1] >= RATE_WINDOW]:
+            _rate_window.pop(key, None)
+        _trim_oldest(_rate_window)
+
 
 def _fail_delay(key: tuple[str, str]) -> int:
     """按失败次数计算本次应延迟的秒数；未达阈值返回 0。
@@ -127,6 +154,7 @@ def _record_fail(key: tuple[str, str]) -> None:
     if count >= FAIL_THRESHOLD:
         # 每次失败都重新起算锁定窗口（指数递增，上限 15 分钟）
         _fail_counts[key][1] = now + min(2 ** (count - FAIL_THRESHOLD), FAIL_DELAY_CAP)
+    _trim_oldest(_fail_counts)
 
 
 def _clear_fail(key: tuple[str, str]) -> None:
@@ -158,7 +186,7 @@ async def register(db_maker, username: str, email: str, password: str, invite_co
         user = User(
             username=username,
             email=email,
-            password_hash=hash_password(password),
+            password_hash=await hash_password_async(password),
             role="user",
         )
         db.add(user)
@@ -184,11 +212,11 @@ async def login(db_maker, username: str, password: str, ip: str) -> LoginSession
         user = (await db.execute(select(User).where(User.username == username))).scalar_one_or_none()
         if user is None:
             # 等时验证：未知用户名也执行一次 argon2，消除时序侧信道
-            verify_password(password, _DUMMY_HASH)
+            await verify_password_async(password, _DUMMY_HASH)
             _record_fail(acct_key)
             _record_fail(ip_key)
             raise AuthError("用户名或密码错误")
-        if not verify_password(password, user.password_hash):
+        if not await verify_password_async(password, user.password_hash):
             _record_fail(acct_key)
             _record_fail(ip_key)
             raise AuthError("用户名或密码错误")
@@ -216,18 +244,38 @@ async def get_session_user(db_maker, token: str) -> User | None:
         return None
     now = datetime.now()
     async with db_maker() as db:
-        sess = (await db.execute(select(LoginSession).where(LoginSession.token == token))).scalar_one_or_none()
-        if sess is None or sess.expires_at < now:
+        row = (
+            await db.execute(
+                select(LoginSession, User)
+                .join(User, User.id == LoginSession.user_id)
+                .where(LoginSession.token == token)
+            )
+        ).first()
+        if row is None:
+            return None
+        sess, user = row
+        if sess.expires_at < now:
             return None
         if (now - sess.last_seen).total_seconds() >= _RENEW_INTERVAL_SECONDS:
             sess.last_seen = now
             sess.expires_at = now + SESSION_TTL
-            await _purge_expired_sessions(db)
+            await _purge_if_due(db)
             await db.commit()
-        return await db.get(User, sess.user_id)
+        return user
 
 
 _RENEW_INTERVAL_SECONDS = 300
+_last_purge = 0.0
+
+
+async def _purge_if_due(db) -> None:
+    """过期会话清扫全局限频：多用户同时续期时只执行一次 DELETE"""
+    global _last_purge
+    now = time.monotonic()
+    if now - _last_purge < _RENEW_INTERVAL_SECONDS:
+        return
+    _last_purge = now
+    await _purge_expired_sessions(db)
 
 
 async def _purge_expired_sessions(db) -> None:
@@ -254,7 +302,7 @@ async def create_admin(db_maker, username: str, email: str, password: str) -> bo
         if dup is not None:
             return False
         db.add(User(username=username, email=email,
-                    password_hash=hash_password(password), role="admin"))
+                    password_hash=await hash_password_async(password), role="admin"))
         await db.commit()
         return True
 

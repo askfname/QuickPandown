@@ -630,6 +630,19 @@ function syncTaskDetails(taskId) {
   refreshTasks().finally(() => store.itemsRefresh.delete(taskId));
 }
 
+// 渲染合并：进度事件每秒多次时最多每帧重绘一次；后台标签页不重绘
+let renderFrame = 0;
+function scheduleRender() {
+  if (renderFrame) return;
+  renderFrame = requestAnimationFrame(() => {
+    renderFrame = 0;
+    if (!document.hidden) renderTasks();
+  });
+}
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) renderTasks();
+});
+
 function handleEvent(ev) {
   if (ev.type === "task") {
     autoDownloadFinishedTask(ev); // 终态 done 即自动下载（内部带去重）
@@ -643,7 +656,7 @@ function handleEvent(ev) {
       delete store.speed[ev.task_id];
       delete store.speedPrev[ev.task_id];
       refreshTasks(); // 终态后拉明细
-      renderTasks();
+      scheduleRender();
       return;
     }
     if (!t) {
@@ -652,7 +665,7 @@ function handleEvent(ev) {
       // 占位任务：明细已在后台补齐但本端不知道 → 拉全量（进度条渲染依赖明细）
       syncTaskDetails(ev.task_id);
     }
-    renderTasks();
+    scheduleRender();
   } else if (ev.type === "item") {
     const t = store.tasks[ev.task_id];
     if (!t) {
@@ -669,7 +682,7 @@ function handleEvent(ev) {
       return;
     }
     diffSpeed(t);
-    renderTasks();
+    scheduleRender();
   }
 }
 

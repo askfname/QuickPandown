@@ -8,7 +8,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from app.config import load_settings, save_settings
+from app.config import MAX_RETENTION_MINUTES, load_settings, save_settings
 from app.quark.account import check_cookie
 
 router = APIRouter(prefix="/api")
@@ -21,8 +21,8 @@ class SettingsPayload(BaseModel):
 
     download_dir: str | None = None
     concurrency: int | None = Field(default=None, ge=1, le=10)
-    # 保留期分钟数
-    retention_minutes: int | None = Field(default=None, ge=1, le=365 * 24 * 60)
+    # 保留期分钟数（上限 7 天：与 tasks.json 历史保留期对齐）
+    retention_minutes: int | None = Field(default=None, ge=1, le=MAX_RETENTION_MINUTES)
     max_download_mb: int | None = Field(default=None, ge=0, le=1024 * 1024)
     # 磁盘预留空间（MB）：0=关闭守门
     reserve_disk_mb: int | None = Field(default=None, ge=0, le=1024 * 1024)

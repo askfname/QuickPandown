@@ -11,8 +11,11 @@ import hashlib
 import hmac
 import io
 import secrets
+import struct
+import tempfile
 import time
 import zipfile
+import zlib
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -112,7 +115,7 @@ def sweep_expired_files(root: Path, tasks: "list[Any]", now: float | None = None
     if not root.exists():
         return 0, 0
     now = now if now is not None else time.time()
-    targets: list[Path] = []
+    targets: set[Path] = set()
     for t in tasks or []:
         for i in t.items:
             if i.status != "done" or not i.keep_until or i.keep_until >= now:
@@ -121,8 +124,8 @@ def sweep_expired_files(root: Path, tasks: "list[Any]", now: float | None = None
             sdir = root / t.session if t.session else root
             cand = (sdir / t.id).joinpath(*parts)
             try:
-                if cand.is_file() and cand not in targets:
-                    targets.append(cand)
+                if cand.is_file():
+                    targets.add(cand)
             except OSError:
                 pass
     removed_files = 0
@@ -132,6 +135,8 @@ def sweep_expired_files(root: Path, tasks: "list[Any]", now: float | None = None
             removed_files += 1
         except OSError:
             pass  # 单文件失败不阻断清扫（占用/权限问题留给下一轮）
+    if not removed_files:
+        return 0, 0  # 没有文件删除时无需全树遍历目录
     # 空目录收拢： deepest 优先，逐层向上尝试 rmdir（非空即停，零递归风险）
     removed_dirs = 0
     dirs = [p for p in root.rglob("*") if p.is_dir()]
@@ -162,6 +167,17 @@ def resolve_item_file(session: str, task_id: str, item_path: str) -> Path | None
         return None
 
 
+def _history_for(engine: Any, session: str) -> list[Any]:
+    """按会话取历史；兼容只接受零参的测试引擎替身"""
+    loader = getattr(engine, "load_history", None)
+    if loader is None:
+        return []
+    try:
+        return loader(session)
+    except TypeError:
+        return loader()
+
+
 def _resolve_single_download(token: str, request: Request, session: str) -> tuple[Path, str]:
     """单文件下载的公共校验链：token 过期→410；token/任务/子项无效→404；
     文件不在盘（被保留期清扫或从未落盘）→410。GET 与 HEAD 探测共用"""
@@ -176,7 +192,8 @@ def _resolve_single_download(token: str, request: Request, session: str) -> tupl
 
     engine = request.app.state.engine
     task = next(
-        (t for t in engine.snapshot(session) + engine.load_history() if t.id == task_id and t.session == session),
+        (t for t in engine.snapshot(session) + _history_for(engine, session)
+         if t.id == task_id and t.session == session),
         None,
     )
     if task is None:
@@ -281,7 +298,7 @@ def _resolve_zip_download(token: str, request: Request, session: str,
 
     engine = request.app.state.engine
     task = next(
-        (t for t in engine.snapshot(session) + engine.load_history()
+        (t for t in engine.snapshot(session) + _history_for(engine, session)
          if t.id == task_id and t.session == session),
         None,
     )
@@ -333,7 +350,7 @@ async def head_zip(token: str, request: Request, session: str = ""):
 async def _zip_stream(pairs):
     """打包输出：ZIP_STORED（多媒体已压缩，重压缩纯耗 CPU）
 
-    总量 ≤64MB 整包构建（内存可承受）；更大时分块 yield 避免双倍内存峰值
+    总量 ≤64MB 整包构建（内存可承受）；更大时边读边发，内存恒定
     """
     import asyncio as _asyncio
 
@@ -354,16 +371,130 @@ def _build_zip(pairs) -> bytes:
     return buf.getvalue()
 
 
+# ZIP32 单字段上限；超过则走临时文件 + zipfile（支持 ZIP64）
+_ZIP32_LIMIT = 0xFFFFFFFF
+_ZIP_CHUNK = 512 * 1024
+
+
+def _dos_time(stamp: float) -> tuple[int, int]:
+    """文件 mtime → DOS 时间/日期（1980–2107，越界钳制）"""
+    t = time.localtime(stamp)
+    year = min(max(t.tm_year, 1980), 2107)
+    return (t.tm_hour << 11) | (t.tm_min << 5) | (t.tm_sec // 2), (
+        (year - 1980) << 9 | (t.tm_mon << 5) | t.tm_mday
+    )
+
+
+def _zip_name(raw: str) -> tuple[bytes, bool]:
+    name = sanitize_rel(raw).replace("\\", "/")
+    try:
+        name.encode("ascii")
+        return name.encode("ascii"), False
+    except UnicodeEncodeError:
+        return name.encode("utf-8"), True
+
+
 async def _iter_zip(pairs):
-    """大文件流式：每个文件单独 ZipInfo 逐块读取拼接（无中央目录回写，兼容性优先分卷）"""
+    """真流式 ZIP：逐文件写本地头 + 数据 + 数据描述符，最后补中央目录。
+
+    内存只保留中央目录元数据，不随文件体积增长；超过 ZIP32 上限时退回
+    临时文件（zipfile 自动写 ZIP64），避免生成损坏归档
+    """
     import asyncio as _asyncio
 
-    def _first() -> bytes:
-        # 流式 zip：逐个文件打包成单成员 zip 再拼接不可行（中央目录），
-        # 大文件场景退化为逐文件独立输出会让浏览器收到多文件——因此
-        # 这里仍整包构建，只是分块 yield，避免一次性占双倍内存
-        return _build_zip(pairs)
+    entries = []
+    total = 0
+    for item, path in pairs:
+        stat = path.stat()
+        total += stat.st_size
+        entries.append((sanitize_rel(item.path), path, stat))
+    if total >= _ZIP32_LIMIT or len(entries) >= 0xFFFF or any(
+        st.st_size >= _ZIP32_LIMIT for _, _, st in entries
+    ):
+        temp_path = _new_zip_temp()
+        writer = _asyncio.create_task(
+            _asyncio.to_thread(_write_zip_temp, entries, temp_path)
+        )
+        try:
+            # shield：客户端中途断开也让写线程收尾，随后统一删除临时文件
+            await _asyncio.shield(writer)
+            with temp_path.open("rb") as fh:
+                while True:
+                    chunk = await _asyncio.to_thread(fh.read, _ZIP_CHUNK)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            if writer.done():
+                _discard_zip_temp(writer, temp_path)
+            else:
+                writer.add_done_callback(lambda task: _discard_zip_temp(task, temp_path))
+        return
 
-    data = await _asyncio.get_event_loop().run_in_executor(None, _first)
-    for i in range(0, len(data), 256 * 1024):
-        yield data[i : i + 256 * 1024]
+    central: list[bytes] = []
+    offset = 0
+    for raw_name, path, stat in entries:
+        name, utf8 = _zip_name(raw_name)
+        flags = 0x08 | (0x800 if utf8 else 0)  # bit3=数据描述符, bit11=UTF-8
+        mtime, mdate = _dos_time(stat.st_mtime)
+        header = struct.pack(
+            "<IHHHHHIIIHH",
+            0x04034B50, 20, flags, 0, mtime, mdate, 0, 0, 0, len(name), 0,
+        )
+        yield header + name
+        crc = 0
+        size = 0
+        with path.open("rb") as fh:
+            while True:
+                chunk = await _asyncio.to_thread(fh.read, _ZIP_CHUNK)
+                if not chunk:
+                    break
+                crc = zlib.crc32(chunk, crc)
+                size += len(chunk)
+                yield chunk
+        descriptor = struct.pack("<IIII", 0x08074B50, crc & 0xFFFFFFFF, size, size)
+        yield descriptor
+        central.append(
+            struct.pack(
+                "<IHHHHHHIIIHHHHHII",
+                0x02014B50, 20, 20, flags, 0, mtime, mdate,
+                crc & 0xFFFFFFFF, size, size,
+                len(name), 0, 0, 0, 0, 0, offset,
+            )
+            + name
+        )
+        offset += len(header) + len(name) + size + len(descriptor)
+
+    cd = b"".join(central)
+    yield cd
+    yield struct.pack(
+        "<IHHHHIIH", 0x06054B50, 0, 0, len(entries), len(entries), len(cd), offset, 0
+    )
+
+
+def _new_zip_temp() -> Path:
+    """预建临时文件路径，写线程与删除方共享同一路径，取消时也能收尾"""
+    tmp = tempfile.NamedTemporaryFile(
+        prefix="quickpandown-", suffix=".zip", delete=False
+    )
+    tmp.close()
+    return Path(tmp.name)
+
+
+def _write_zip_temp(entries, path: Path) -> None:
+    """ZIP64 兜底：写入预建临时文件（线程内执行，由调用方删除）"""
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
+        for name, path_in, _stat in entries:
+            zf.write(path_in, name)
+
+
+def _discard_zip_temp(task: Any, path: Path) -> None:
+    """取走写线程的结果并删除临时文件（成功、失败、取消统一收尾）"""
+    try:
+        task.exception()
+    except BaseException:  # noqa: BLE001 - 异常已在别处处理或取消
+        pass
+    try:
+        path.unlink()
+    except OSError:
+        pass

@@ -1,12 +1,12 @@
-"""管理员 API：邀请码管理与在线统计z，仅 role=admin 可达（中间件把关）"""
+"""管理员 API：邀请码管理与在线统计，仅 role=admin 可达（中间件把关）"""
 
 from __future__ import annotations
 
-from datetime import datetime
+from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, select
+from sqlalchemy import select
 
 from app.db import InviteCode
 
@@ -15,9 +15,6 @@ router = APIRouter(prefix="/api/admin")
 
 def _db_maker(request: Request) -> Any:
     return request.app.state.db_maker
-
-
-from typing import Any  # noqa: E402
 
 
 class InvitesPayload(BaseModel):
@@ -45,16 +42,20 @@ async def list_invites(request: Request) -> dict:
 async def add_invites(payload: InvitesPayload, request: Request) -> dict:
     """批量添加：跳过已存在的码，报告添加数与重复数"""
     user = request.state.user
+    codes = [raw.strip() for raw in payload.codes if raw.strip()]
     added, duplicated = 0, 0
+    if not codes:
+        return {"ok": True, "added": 0, "duplicated": 0}
     async with _db_maker(request)() as db:
-        for raw in payload.codes:
-            code = raw.strip()
-            if not code:
-                continue
-            dup = (await db.execute(select(InviteCode).where(InviteCode.code == code))).scalar_one_or_none()
-            if dup is not None:
+        existing = set(
+            (await db.execute(select(InviteCode.code).where(InviteCode.code.in_(codes)))).scalars()
+        )
+        seen: set[str] = set()
+        for code in codes:
+            if code in existing or code in seen:
                 duplicated += 1
                 continue
+            seen.add(code)
             db.add(InviteCode(code=code, created_by=user.id))
             added += 1
         await db.commit()
@@ -64,10 +65,17 @@ async def add_invites(payload: InvitesPayload, request: Request) -> dict:
 @router.delete("/invites")
 async def remove_invites(payload: InvitesPayload, request: Request) -> dict:
     """批量删除：已使用的不可删"""
+    codes = [code.strip() for code in payload.codes if code.strip()]
     removed, skipped_used = 0, 0
+    if not codes:
+        return {"ok": True, "removed": 0, "skipped_used": 0}
     async with _db_maker(request)() as db:
-        for code in payload.codes:
-            inv = (await db.execute(select(InviteCode).where(InviteCode.code == code.strip()))).scalar_one_or_none()
+        rows = (
+            await db.execute(select(InviteCode).where(InviteCode.code.in_(codes)))
+        ).scalars().all()
+        by_code = {inv.code: inv for inv in rows}
+        for code in dict.fromkeys(codes):
+            inv = by_code.get(code)
             if inv is None:
                 continue
             if inv.used_by is not None:

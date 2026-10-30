@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field, replace
@@ -29,19 +31,20 @@ NO_COOKIE_CODE = 10001
 NO_COOKIE_MESSAGE = "需要先设置夸克 Cookie"
 
 # 终态任务内存保留时长：与下载 token TTL 同量级；过期后从 _tasks 修剪，
-# UI 与下载链接仍能经 tasks.json 历史寻址（tasks_for 会合并历史）。failed 不修剪
-#（retry 需要 Cookie 与待重试子项）。长跑进程里终态任务不再无限堆积
-TERMINAL_TTL_SECONDS = 3600
+# UI 与下载链接仍能经 tasks.json 历史寻址（tasks_for 会合并历史）。
+# failed 另给 24h，供用户重试；到期后连同 Cookie/待重试项与 .part 一并清理
+TERMINAL_TTL_SECONDS = 1800
+FAILED_TTL_SECONDS = 24 * 3600
 # 终态任务的 tasks.json 历史保留期：更老的条目在 persist 落盘/载入时修剪，
-# 防 tasks.json 随时间无限增长
+# 防 tasks.json 随时间无限增长；带未来 keep_until 的条目会保留到文件到期
 HISTORY_RETENTION_SECONDS = 7 * 24 * 3600
-# 进度事件节流间隔：on_progress 每个 HTTP 块都会回调，SSE 全量转发会让
-# 总线/前端被高频事件淹没；每 (task, 子项) 至多 ~0.3s 推一次（完成必推）
-PROGRESS_INTERVAL_SECONDS = 0.3
+# 进度事件节流间隔：SSE 全量转发会让总线/前端被高频事件淹没，
+# 每 (task, 子项) 至多 ~1s 推一次（完成必推）
+PROGRESS_INTERVAL_SECONDS = 1.0
 # 排队任务磁盘复查间隔：即使未收到监控唤醒，也定期自查，避免永久挂起
-DISK_RECHECK_SECONDS = 2.0
+DISK_RECHECK_SECONDS = 10.0
 # 磁盘监控轮询间隔：空间释放后及时叫醒排队任务
-DISK_MONITOR_INTERVAL_SECONDS = 5.0
+DISK_MONITOR_INTERVAL_SECONDS = 15.0
 
 
 class TaskStatus(str, Enum):
@@ -55,6 +58,7 @@ class TaskStatus(str, Enum):
 
 
 _TERMINAL = {TaskStatus.done, TaskStatus.failed, TaskStatus.cancelled}
+_TERMINAL_VALUES = frozenset(s.value for s in _TERMINAL)
 
 
 @dataclass
@@ -125,8 +129,7 @@ class TaskEngine:
         # task_id -> sub_id -> 转存后拿到的直链
         self._links: dict[str, dict[str, LinkItem]] = {}
         # task_id -> 用户 Cookie（仅内存；任务终态即清，避免进持久化）
-        # failed 任务保留 Cookie 供 retry 使用，任务离开内存（persist 后从 _tasks
-        # 移除不在本期实现，见 plan）时随进程结束清空
+        # failed 任务保留 Cookie 供 retry 使用，过期修剪时一并清除
         self._cookies: dict[str, str] = {}
         # (task_id, sub_id) -> 上次进度事件 time.monotonic()：SSE 进度节流
         self._progress_ts: dict[tuple[str, str], float] = {}
@@ -136,6 +139,16 @@ class TaskEngine:
         self._active_downloads = 0
         # 已准入任务的预估待写入字节：并发任务同时下载时仍为磁盘保留余量
         self._reserved_bytes = 0
+        # tasks.json 解析缓存：(mtime_ns, size, raw dicts)。历史文件只在
+        # persist/freeze 时变化，热路径（/api/tasks、文件下载校验、清扫）
+        # 不必反复读盘解析；raw 仅引擎内部使用，对外始终返回新 Task 对象
+        self._history_cache: tuple[int, int, list[dict]] | None = None
+        # 写盘串行化：persist 可能在线程池执行，退出时又会在事件循环补写一次，
+        # 锁保证两次写不会交错覆盖
+        self._persist_lock = threading.Lock()
+        # 创建路径上的修剪节流：后台维护循环已定期修剪，避免每建一个任务
+        # 都全表扫描（failed 任务现在会保留 24h，表可能较大）
+        self._last_prune = 0.0
 
     # ---- 创建 / 查询 -------------------------------------------------------
 
@@ -156,7 +169,8 @@ class TaskEngine:
         if not cookie:
             raise QuarkApiError(NO_COOKIE_CODE, NO_COOKIE_MESSAGE)
 
-        self._prune_terminal()  # 借新任务入场顺带修剪过期终态（有任务才扫，零额外周期）
+        if time.monotonic() - self._last_prune >= 60:
+            self._prune_terminal()  # 借新任务入场顺带修剪；后台循环另会定期修剪
 
         task = Task(
             id=uuid.uuid4().hex[:12],
@@ -189,6 +203,7 @@ class TaskEngine:
         flag = self._cancel_flags.get(task_id)
         if task is None or flag is None:
             return
+        client: Any = None
         try:
             if flag.is_set() or task.status is not TaskStatus.queued:
                 raise asyncio.CancelledError()
@@ -260,6 +275,8 @@ class TaskEngine:
         except Exception as exc:  # noqa: BLE001 - 任何未预期异常都落到 failed
             self._preparers.pop(task_id, None)
             self._finish_fail_preparing(task, str(exc) or exc.__class__.__name__)
+        finally:
+            await self._aclose_client(client)
 
     def _finish_fail_preparing(self, task: Task, message: str) -> None:
         """解析期失败收尾：转 failed 可重试；_pending 保留供 retry 重新解析"""
@@ -280,6 +297,7 @@ class TaskEngine:
                 message=t.message,
                 passcode=t.passcode,
                 session=t.session,
+                terminal_at=t.terminal_at,
                 disk_low=t.disk_low,
             )
             for t in self._tasks.values()
@@ -290,8 +308,8 @@ class TaskEngine:
         """本会话的全部任务：内存活任务 + 历史合并（去重，活的优先）"""
         live = {t.id: t for t in self.snapshot(session)}
         merged: list[Task] = list(live.values())
-        for h in self.load_history():
-            if h.session == session and h.id not in live:
+        for h in self.load_history(session):
+            if h.id not in live:
                 merged.append(h)
         return merged
 
@@ -458,11 +476,14 @@ class TaskEngine:
             return False
 
         client = self._client_factory(None)
-        client.cookie = self._cookie_for(task)
-        entry = await self._share_session.resolve(task.share_id, task.passcode)
-        tree = await walk_subtree(client, task.share_id, entry.stoken, "0")
-        by_path = {str(e["path"]): e for e in tree if not e["dir"]}
-        pairs = [(s.id, by_path[s.path]) for s in retry_subs if s.path in by_path]
+        try:
+            client.cookie = self._cookie_for(task)
+            entry = await self._share_session.resolve(task.share_id, task.passcode)
+            tree = await walk_subtree(client, task.share_id, entry.stoken, "0")
+            by_path = {str(e["path"]): e for e in tree if not e["dir"]}
+            pairs = [(s.id, by_path[s.path]) for s in retry_subs if s.path in by_path]
+        finally:
+            await self._aclose_client(client)
         if not pairs:
             return False
 
@@ -482,54 +503,121 @@ class TaskEngine:
     async def sweep_temp_on_startup(self) -> int:
         """列空 QuickPandownTemp 并按 fid 删除，返回删除的文件条目数"""
         client = self._client_factory(None)
-        temp_fid = await transfer.ensure_temp_dir(client, self.settings.temp_dir_name)
-        snapshot = await transfer.temp_snapshot(client, temp_fid)
-        fids = [fid for fid in snapshot.values() if fid]
-        if fids:
-            await transfer.delete_fids(client, fids)
+        try:
+            temp_fid = await transfer.ensure_temp_dir(client, self.settings.temp_dir_name)
+            snapshot = await transfer.temp_snapshot(client, temp_fid)
+            fids = [fid for fid in snapshot.values() if fid]
+            if fids:
+                await transfer.delete_fids(client, fids)
+        finally:
+            await self._aclose_client(client)
         return len(fids)
+
+    def sweep_orphan_parts(self) -> int:
+        """启动时清理所有 .part：任务队列不跨重启恢复，断点文件已无续传可能。
+
+        返回删除的文件数；顺带收拢清空后的任务/会话目录
+        """
+        base = self._download_base()
+        if not base.exists():
+            return 0
+        removed = 0
+        parents: set[Path] = set()
+        for part in base.rglob("*.part"):
+            try:
+                if part.is_file():
+                    part.unlink()
+                    removed += 1
+                    parents.add(part.parent)
+            except OSError:
+                continue
+        for parent in sorted(parents, key=lambda p: len(p.parts), reverse=True):
+            while parent != base:
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
+        return removed
 
     # ---- 持久化 ------------------------------------------------------------
 
-    def persist(self) -> None:
+    def _history_raw(self) -> list[dict]:
+        """读取 tasks.json 的原始条目（按 mtime/size 缓存，避免热路径反复解析）。
+
+        返回缓存内部列表：仅供 persist/load_history/freeze 使用，不对外暴露
+        """
+        try:
+            stat = self._db_path.stat()
+        except OSError:
+            self._history_cache = None
+            return []
+        key = (stat.st_mtime_ns, stat.st_size)
+        cache = self._history_cache
+        if cache is not None and cache[0] == key[0] and cache[1] == key[1]:
+            return cache[2]
+        try:
+            data = json.loads(self._db_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = None
+        raws = data.get("tasks") if isinstance(data, dict) else None
+        entries = [raw for raw in raws or [] if isinstance(raw, dict)]
+        self._history_cache = (key[0], key[1], entries)
+        return entries
+
+    def _write_history(self, entries: list[dict]) -> None:
+        """原子写回 tasks.json：紧凑 JSON + 同目录临时文件替换，避免半截文件"""
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._db_path.with_name(f".{self._db_path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            tmp.write_text(
+                json.dumps({"tasks": entries}, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            os.replace(tmp, self._db_path)
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        self._history_cache = None
+
+    def terminal_payload(self) -> list[dict]:
+        """在事件循环线程内提取终态任务快照。
+
+        写盘放线程执行时，绝不能在后台线程遍历 _tasks——下载/新建任务会同时
+        改字典，触发 "dictionary changed size during iteration"
+        """
+        return [_task_to_dict(t) for t in self._tasks.values() if t.status in _TERMINAL]
+
+    def persist(self, terminal: list[dict] | None = None) -> None:
         """把终态任务 upsert 进 db_path（按 id 合并既有历史，重启后不丢旧记录）
 
-        落盘同时修剪超过 HISTORY_RETENTION_SECONDS 的超期历史（终态任务）：
-        tasks.json 不随时间无限增长；最近条目与本次终态任务正常写入
+        落盘同时修剪过期历史；terminal 由调用方在事件循环线程内先取好，
+        后台线程只做磁盘 I/O
         """
-        existing: dict[str, dict] = {}
-        try:
-            data = json.loads(self._db_path.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                for raw in data.get("tasks") or []:
-                    if (isinstance(raw, dict) and raw.get("id")
-                            and not _history_expired(raw)):
-                        existing[str(raw["id"])] = raw
-        except (OSError, ValueError):
-            existing = {}  # 文件缺失或损坏：视作空历史
+        if terminal is None:
+            terminal = self.terminal_payload()
+        with self._persist_lock:
+            existing: dict[str, dict] = {}
+            for raw in self._history_raw():
+                if raw.get("id") and not _history_expired(raw):
+                    existing[str(raw["id"])] = raw
+            for raw in terminal:
+                existing[str(raw["id"])] = raw
+            self._write_history(list(existing.values()))
 
-        for task in self._tasks.values():
-            if task.status in _TERMINAL:
-                existing[task.id] = _task_to_dict(task)
+    def load_history(self, session: str | None = None) -> list[Task]:
+        """从 db_path 读历史任务；过期/损坏条目跳过，可按会话过滤后解析。
 
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._db_path.write_text(
-            json.dumps({"tasks": list(existing.values())}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-
-    def load_history(self) -> list[Task]:
-        """从 db_path 读历史任务；过期条目与损坏条目一并跳过（文件缺失逐条回退）"""
-        try:
-            data = json.loads(self._db_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return []
-        if not isinstance(data, dict):
-            return []
+        返回全新 Task 对象：调用方修改不会污染缓存
+        """
         tasks: list[Task] = []
         now = time.time()
-        for raw in data.get("tasks") or []:
-            if not isinstance(raw, dict) or _history_expired(raw, now):
+        for raw in self._history_raw():
+            if session is not None and str(raw.get("session") or "") != session:
+                continue
+            if _history_expired(raw, now):
                 continue
             try:
                 tasks.append(_task_from_dict(raw))
@@ -543,17 +631,12 @@ class TaskEngine:
         已有 keep_until 的子项跳过；可按 done_at 或落盘文件 mtime 推算的用
         【当时】保留时长计算并写回 tasks.json
         """
-        try:
-            data = json.loads(self._db_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return 0
-        if not isinstance(data, dict):
+        data = {"tasks": self._history_raw()}
+        if not data["tasks"]:
             return 0
         window = max(1, self.settings.retention_minutes) * 60
         changed = 0
-        for raw in data.get("tasks") or []:
-            if not isinstance(raw, dict):
-                continue
+        for raw in data["tasks"]:
             session = str(raw.get("session") or "")
             for item in raw.get("items") or []:
                 if not isinstance(item, dict) or item.get("status") != "done":
@@ -568,11 +651,7 @@ class TaskEngine:
                 item["keep_until"] = stamp + window if stamp else None
                 changed += 1
         if changed:
-            self._db_path.parent.mkdir(parents=True, exist_ok=True)
-            self._db_path.write_text(
-                json.dumps({"tasks": data.get("tasks") or []}, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            self._write_history(data["tasks"])
         return changed
 
     def _item_file_mtime(self, session: str, task_id: str, rel: str) -> float:
@@ -593,6 +672,17 @@ class TaskEngine:
 
     # ---- 内部 --------------------------------------------------------------
 
+    @staticmethod
+    async def _aclose_client(client: Any) -> None:
+        """关闭临时夸克客户端；测试 fake 没有 aclose 时静默跳过"""
+        close = getattr(client, "aclose", None)
+        if close is None:
+            return
+        try:
+            await close()
+        except Exception as exc:  # noqa: BLE001 - 关闭失败不影响任务结果
+            logger.debug("关闭临时客户端失败: %s", exc)
+
     async def _transfer(self, task: Task, flag: asyncio.Event) -> None:
         """转存并取直链；LinkItem 按 (sub_id, leaf) 顺序映射回 SubItem"""
         self._set_status(task, TaskStatus.transferring, "正在转存…")
@@ -601,19 +691,22 @@ class TaskEngine:
             raise QuarkApiError(0, "缺少转存清单")
 
         cookie_client = self._client_factory(None)
-        cookie_client.cookie = self._cookie_for(task)
-        entry = await self._share_session.resolve(task.share_id, task.passcode)
-        # 两级临时目录：先确保 QuickPandownTemp 父目录存在，再在其中建会话子目录
-        parent_fid = await transfer.ensure_temp_dir(cookie_client, self.settings.temp_dir_name)
-        temp_fid = await transfer.ensure_temp_dir(
-            cookie_client, task.session or "default", parent_fid
-        )
-        links = await transfer.transfer_and_link(
-            cookie_client,
-            (task.share_id, entry.stoken),
-            [leaf for _, leaf in pairs],
-            temp_fid,
-        )
+        try:
+            cookie_client.cookie = self._cookie_for(task)
+            entry = await self._share_session.resolve(task.share_id, task.passcode)
+            # 两级临时目录：先确保 QuickPandownTemp 父目录存在，再在其中建会话子目录
+            parent_fid = await transfer.ensure_temp_dir(cookie_client, self.settings.temp_dir_name)
+            temp_fid = await transfer.ensure_temp_dir(
+                cookie_client, task.session or "default", parent_fid
+            )
+            links = await transfer.transfer_and_link(
+                cookie_client,
+                (task.share_id, entry.stoken),
+                [leaf for _, leaf in pairs],
+                temp_fid,
+            )
+        finally:
+            await self._aclose_client(cookie_client)
         self._links[task.id] = {
             sub_id: link for (sub_id, _), link in zip(pairs, links)
         }
@@ -762,11 +855,13 @@ class TaskEngine:
             if sub.status == "done":
                 continue
             dest = self._dest_for(sub, task)
-            try:
-                dest.unlink()
-                removed += 1
-            except OSError:
-                continue  # 占用/权限：残留交给保留期清扫兜底
+            # 半成品 .part 与空占位都要删；只删 dest 会让断点残留长期占盘
+            for path in (dest, dest.with_name(dest.name + ".part")):
+                try:
+                    path.unlink()
+                    removed += 1
+                except OSError:
+                    continue  # 不存在/占用/权限：残留交给保留期清扫兜底
             parent = dest.parent
             while parent != base:
                 try:
@@ -787,8 +882,11 @@ class TaskEngine:
             return True
         try:
             client = self._client_factory(None)
-            client.cookie = self._cookie_for(task)
-            ok = await transfer.delete_fids(client, fids)
+            try:
+                client.cookie = self._cookie_for(task)
+                ok = await transfer.delete_fids(client, fids)
+            finally:
+                await self._aclose_client(client)
         except Exception as exc:  # noqa: BLE001 - 清理失败不炸任务
             logger.warning("清理云端临时文件失败: %s", exc)
             ok = False
@@ -798,7 +896,7 @@ class TaskEngine:
 
     def _progress(self, task: Task, sub: SubItem, done: int, total: int) -> None:
         sub.done_bytes = done
-        # 进度节流：同一子项 0.3s 内只推一次 SSE（完成时必推，终态不丢）
+        # 进度节流：同一子项在 PROGRESS_INTERVAL_SECONDS 内只推一次 SSE（完成必推）
         key = (task.id, sub.id)
         now = time.monotonic()
         last = self._progress_ts.get(key)
@@ -824,27 +922,57 @@ class TaskEngine:
         for key in [k for k in self._progress_ts if k[0] == task.id]:
             self._progress_ts.pop(key, None)
         if status is not TaskStatus.failed:
-            # failed 保留 Cookie 供 retry；其余终态立即清除
+            # failed 保留 Cookie/待重试项供 retry；其余终态立即清除
             self._cookies.pop(task.id, None)
+            self._pending.pop(task.id, None)
         # 云端临时文件删除不压在任务终态上做，交付端也没有清理职责：
         # 文件由保留期清扫按冻结的 keep_until 到点删除
 
     def _prune_terminal(self) -> None:
-        """修剪内存:终态超过 TTL 的 done/cancelled 任务与孤儿取消标志收出内存。
+        """修剪内存里的过期终态任务，释放字典与 Cookie 引用。
 
-        历史已 upsert 进 tasks.json（persist 先行），UI 与下载链接走历史合并，
-        不受修剪影响；failed 任务保留（retry 需要 Cookie 与待重试子项）
+        done/cancelled 超过 TERMINAL_TTL_SECONDS 即移除；failed 保留
+        FAILED_TTL_SECONDS 供重试，到期后连同 .part 残留一起清理。历史
+        已 upsert 进 tasks.json，UI 与下载链接走历史合并，不受修剪影响
         """
         if not self._tasks:
+            self._last_prune = time.monotonic()
             return
+        self._last_prune = time.monotonic()
         now = time.time()
         for task_id in list(self._tasks):
             task = self._tasks[task_id]
-            stale = (task.terminal_at is not None
-                     and now - task.terminal_at > TERMINAL_TTL_SECONDS)
-            if stale and task.status in (TaskStatus.done, TaskStatus.cancelled):
-                self._tasks.pop(task_id, None)
-                self._cancel_flags.pop(task_id, None)
+            if task.terminal_at is None:
+                continue
+            age = now - task.terminal_at
+            if task.status in (TaskStatus.done, TaskStatus.cancelled):
+                stale = age > TERMINAL_TTL_SECONDS
+            elif task.status is TaskStatus.failed:
+                stale = age > FAILED_TTL_SECONDS
+                if stale:
+                    self._cleanup_local(task)  # 失败的半成品不再有重试价值
+            else:
+                continue
+            if not stale:
+                continue
+            self._drop_task(task_id)
+
+    def _drop_task(self, task_id: str) -> None:
+        """移除任务的全部内存引用（含 Cookie/待重试项/进度节流表）"""
+        self._tasks.pop(task_id, None)
+        self._cancel_flags.pop(task_id, None)
+        self._runners.pop(task_id, None)
+        self._preparers.pop(task_id, None)
+        self._pending.pop(task_id, None)
+        self._leaves.pop(task_id, None)
+        self._links.pop(task_id, None)
+        self._cookies.pop(task_id, None)
+        for key in [k for k in self._progress_ts if k[0] == task_id]:
+            self._progress_ts.pop(key, None)
+
+    def maintenance(self) -> None:
+        """周期维护入口：修剪过期终态任务（由后台监控循环低频调用）"""
+        self._prune_terminal()
 
     def on_settings_changed(self) -> None:
         """设置保存后的联动钩子（保留期清扫循环重启由 main 的 sweeper 负责）"""
@@ -886,8 +1014,15 @@ class TaskEngine:
 
 
 def _under_any(path: str, dir_paths: set[str]) -> bool:
-    """path 是否落在任一已选目录之下（含多级）"""
-    return any(path.startswith(d + "/") for d in dir_paths)
+    """path 是否落在任一已选目录之下（逐级向上匹配，O(深度)）"""
+    if not dir_paths:
+        return False
+    parent = path
+    while "/" in parent:
+        parent = parent.rsplit("/", 1)[0]
+        if parent in dir_paths:
+            return True
+    return False
 
 
 def _fmt_bytes(n: int) -> str:
@@ -899,11 +1034,28 @@ def _fmt_bytes(n: int) -> str:
 
 
 def _history_expired(raw: dict, now: float | None = None) -> bool:
-    """tasks.json 历史条目是否已超保留期：优先按终态时刻，老数据回退 created_at"""
-    if str(raw.get("status") or "") not in {s.value for s in _TERMINAL}:
+    """tasks.json 历史条目是否已超保留期：优先按终态时刻，老数据回退 created_at。
+
+    关联文件到期后历史还要再留一个保留期：清扫循环有间隔、服务也可能停机，
+    若历史与 keep_until 同时过期，文件会在清扫前失去记录而永久残留
+    """
+    if str(raw.get("status") or "") not in _TERMINAL_VALUES:
         return False
-    anchor = float(raw.get("terminal_at") or 0.0) or float(raw.get("created_at") or 0.0)
-    return anchor + HISTORY_RETENTION_SECONDS < (now if now is not None else time.time())
+    now = now if now is not None else time.time()
+    try:
+        anchor = float(raw.get("terminal_at") or 0.0) or float(raw.get("created_at") or 0.0)
+    except (TypeError, ValueError):
+        return True  # 损坏条目不参与历史合并
+    if anchor + HISTORY_RETENTION_SECONDS >= now:
+        return False
+    for item in raw.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        keep_until = item.get("keep_until")
+        if isinstance(keep_until, (int, float)):
+            if keep_until + HISTORY_RETENTION_SECONDS > now:
+                return False
+    return True
 
 
 def _task_to_dict(task: Task) -> dict:

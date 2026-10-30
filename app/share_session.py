@@ -63,6 +63,13 @@ class ShareSession:
     def set_client(self, client: Any) -> None:
         self._client = client
 
+    async def aclose(self) -> None:
+        """关闭内置兜底客户端（模块单例退出时调用）"""
+        client, self._client = self._client, None
+        close = getattr(client, "aclose", None)
+        if close is not None:
+            await close()
+
     def clear(self) -> None:
         """清空全部缓存条目（测试隔离或强制重取时使用）"""
         self._cache.clear()

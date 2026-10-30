@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
 from typing import Any
 
 import httpx
@@ -52,20 +51,18 @@ def _user(request: Request):
 
 
 def _serialize_tasks(tasks: list[Task], app: Any) -> list[dict]:
-    """dataclasses.asdict + TaskStatus 值字符串化；done 项附文件下载 URL（HMAC token）
+    """Task → JSON 字典；done 项附文件下载 URL（HMAC token）
 
-    多文件任务发打包 token（/api/files/{token}/zip），浏览器一次拿到整个 zip；
-    单文件任务维持单文件 URL。expires_at 直接读取子项冻结的 keep_until
-    （完成瞬间用当时保留时长定死并持久化）：前端按它展示有效期，清晰的失效
-    时刻不随后续的设置调整漂移
+    直接构造字典而不用 dataclasses.asdict：snapshot 已返回副本，省一次
+    全量深拷贝。多文件任务发打包 token（/api/files/{token}/zip），单文件
+    任务维持单文件 URL。expires_at 直接读取子项冻结的 keep_until
     """
     from app.api.files_api import issue_zip_token
 
     secret = getattr(app.state, "secret", b"")
     out = []
     for t in tasks:
-        d = asdict(t)
-        d["status"] = t.status.value if isinstance(t.status, TaskStatus) else str(t.status)
+        d = _task_dict(t)
         done_items = [i for i in d["items"] if t.status is TaskStatus.done and i["status"] == "done"]
         for item in d["items"]:
             item["file_url"] = None
@@ -82,6 +79,36 @@ def _serialize_tasks(tasks: list[Task], app: Any) -> list[dict]:
         d["expires_at"] = _keep_until(t) if has_links else None
         out.append(d)
     return out
+
+
+def _task_dict(task: Task) -> dict:
+    """任务与其子项的 JSON 形状（字段与 dataclasses.asdict 保持一致）"""
+    return {
+        "id": task.id,
+        "share_id": task.share_id,
+        "title": task.title,
+        "created_at": task.created_at,
+        "status": task.status.value if isinstance(task.status, TaskStatus) else str(task.status),
+        "items": [
+            {
+                "id": s.id,
+                "name": s.name,
+                "path": s.path,
+                "size": s.size,
+                "done_bytes": s.done_bytes,
+                "status": s.status,
+                "error": s.error,
+                "done_at": s.done_at,
+                "keep_until": s.keep_until,
+            }
+            for s in task.items
+        ],
+        "message": task.message,
+        "passcode": task.passcode,
+        "session": task.session,
+        "terminal_at": task.terminal_at,
+        "disk_low": task.disk_low,
+    }
 
 
 def _keep_until(task: Task) -> float | None:
@@ -177,11 +204,12 @@ async def tasks(request: Request) -> dict:
 async def cancel(task_id: str, request: Request) -> dict:
     engine = _engine(request)
     user = _user(request)
-    if task_id not in {t.id for t in engine.tasks_for(user.username)}:
+    live = {t.id: t for t in engine.snapshot(user.username)}
+    if task_id not in live:
+        # 只存在于历史（服务重启后）视为已结束；完全不存在则 404
+        if task_id in {t.id for t in engine.tasks_for(user.username)}:
+            raise HTTPException(status_code=400, detail="任务已结束，无需取消")
         raise HTTPException(status_code=404, detail=f"任务不存在: {task_id}")
-    if task_id not in {t.id for t in engine.snapshot(user.username)}:
-        # 只存在于历史（服务重启后）：任务已终结，无活动可取消
-        raise HTTPException(status_code=400, detail="任务已结束，无需取消")
     await engine.cancel(task_id, user.username)
     return {"ok": True}
 
@@ -190,14 +218,14 @@ async def cancel(task_id: str, request: Request) -> dict:
 async def retry(task_id: str, request: Request) -> dict:
     engine = _engine(request)
     user = _user(request)
-    if task_id not in {t.id for t in engine.tasks_for(user.username)}:
+    live = {t.id: t for t in engine.snapshot(user.username)}
+    if task_id not in live:
+        if task_id in {t.id for t in engine.tasks_for(user.username)}:
+            raise HTTPException(
+                status_code=400, detail="该任务已随服务重启失效，请重新提交下载"
+            )
         raise HTTPException(status_code=404, detail=f"任务不存在: {task_id}")
-    if task_id not in {t.id for t in engine.snapshot(user.username)}:
-        # 只存在于历史（服务重启后）：引擎内存态已失效，重试无意义
-        raise HTTPException(
-            status_code=400, detail="该任务已随服务重启失效，请重新提交下载"
-        )
-    task = next(t for t in engine.snapshot(user.username) if t.id == task_id)
+    task = live[task_id]
     if task.status is not TaskStatus.failed:
         raise HTTPException(
             status_code=400, detail="任务当前状态无法重试（重试仅对失败任务可用）"
@@ -220,7 +248,7 @@ async def events(request: Request, session: str = "") -> StreamingResponse:
     user = _user(request)
     session = user.username
     bus = request.app.state.bus
-    queue = bus.subscribe()
+    queue = bus.subscribe(session)
 
     async def stream():
         try:

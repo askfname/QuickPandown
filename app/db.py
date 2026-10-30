@@ -168,8 +168,10 @@ async def active_sessions(db, within_seconds: int = 900) -> int:
     """15 分钟内活跃的登录会话数（在线用户数）"""
     from datetime import timedelta
 
+    from sqlalchemy import func
+
     cutoff = datetime.now() - timedelta(seconds=within_seconds)
     result = await db.execute(
-        select(LoginSession.token).where(LoginSession.last_seen >= cutoff)
+        select(func.count()).select_from(LoginSession).where(LoginSession.last_seen >= cutoff)
     )
-    return len(set(result.all()))
+    return int(result.scalar_one() or 0)

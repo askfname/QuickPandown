@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from pathlib import Path
 
 import httpx
@@ -30,6 +31,11 @@ _TERMINAL_STATUSES = {
     TaskStatus.cancelled.value,
 }
 
+# 终态事件合并窗口：同一批完成的任务只写一次 tasks.json
+PERSIST_DEBOUNCE_SECONDS = 1.0
+
+logger = logging.getLogger(__name__)
+
 
 class OptionalStaticFiles(StaticFiles):
     """目录缺失时不报错（返回 404），目录存在后行为与 StaticFiles 一致。
@@ -51,12 +57,18 @@ async def _lifespan(app: FastAPI):
     app.state.db_engine = await init_db(get_db_url())
     app.state.db_maker = session_maker(app.state.db_engine)
     engine: TaskEngine = app.state.engine
-    app.state.history = engine.load_history()
     try:
-        # 历史档案一次性补齐冻结到期时刻（keep_until）
-        # 按启动时的保留时长定死并落盘，之后的调整只影响新下载文件
+        # 先补齐历史档案的冻结到期时刻（keep_until），再载入历史：
+        # 否则缺字段的老条目可能在补齐前就被保留期过滤掉
         engine.freeze_history_expiry()
     except Exception:  # noqa: BLE001 - 补齐失败不阻断启动
+        pass
+    try:
+        # 队列不跨重启恢复：遗留 .part 没有续传机会，启动即回收磁盘
+        sweep_parts = getattr(engine, "sweep_orphan_parts", None)
+        if sweep_parts is not None:
+            sweep_parts()
+    except Exception:  # noqa: BLE001 - 残留清理失败不阻断应用
         pass
     try:
         await engine.sweep_temp_on_startup()
@@ -96,10 +108,13 @@ async def _lifespan(app: FastAPI):
     engine.on_settings_changed = _start_sweeper  # 设置保存时换挡（间隔/开关）
     _start_sweeper()
 
-    # 磁盘监控：周期唤醒排队任务重评空间；设置保存后另有即时唤醒
+    # 磁盘监控：周期唤醒排队任务重评空间；顺带修剪过期终态任务
     async def disk_monitor_loop() -> None:
         while True:
             try:
+                maintenance = getattr(engine, "maintenance", None)
+                if maintenance is not None:
+                    maintenance()
                 wake = getattr(engine, "notify_disk_changed", None)
                 if wake is not None:
                     await wake()
@@ -112,11 +127,24 @@ async def _lifespan(app: FastAPI):
     queue = app.state.bus.subscribe()
 
     async def persist_loop() -> None:
+        """终态事件合并落盘：多次完成只写一次，写盘放线程避免阻塞事件循环"""
+        persist = getattr(engine, "persist", None)
+        if persist is None:
+            return
         try:
             while True:
                 event = await queue.get()
                 if event.get("type") == "task" and event.get("status") in _TERMINAL_STATUSES:
-                    engine.persist()
+                    await asyncio.sleep(PERSIST_DEBOUNCE_SECONDS)
+                    try:
+                        snapshot = getattr(engine, "terminal_payload", None)
+                        if snapshot is None:
+                            await asyncio.to_thread(persist)
+                        else:
+                            # 事件循环内取快照，后台线程只做磁盘 I/O
+                            await asyncio.to_thread(persist, snapshot())
+                    except Exception:  # noqa: BLE001 - 单次写盘失败不终止持久化循环
+                        logger.warning("持久化任务历史失败", exc_info=True)
         except asyncio.CancelledError:
             pass
 
@@ -127,6 +155,17 @@ async def _lifespan(app: FastAPI):
         persister.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await persister
+        # 取消协程不会终止已提交到线程池的写盘；排一个空任务等它跑完，
+        # 保证下面的补写一定最后落盘（旧快照不会反过来覆盖新状态）
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(lambda: None)
+        # 退出前补一次落盘：合并窗口内尚未写入的终态任务不丢
+        persist = getattr(engine, "persist", None)
+        if persist is not None:
+            try:
+                persist()
+            except Exception:  # noqa: BLE001 - 退出清理不因写盘失败中断
+                logger.warning("退出时持久化任务历史失败", exc_info=True)
         if sweep_task is not None:
             app.state.sweeper_stop.set()
             sweep_task.cancel()
@@ -136,6 +175,14 @@ async def _lifespan(app: FastAPI):
         with contextlib.suppress(asyncio.CancelledError):
             await disk_task
         app.state.bus.unsubscribe(queue)
+        close = getattr(getattr(app.state, "client", None), "aclose", None)
+        if close is not None:
+            with contextlib.suppress(Exception):
+                await close()
+        close_share = getattr(share_session, "aclose", None)
+        if close_share is not None:
+            with contextlib.suppress(Exception):
+                await close_share()
         if app.state.db_engine is not None:
             # 连接池收尾：不 dispose 会在进程退出时留下 aiomysql
             # "Event loop is closed" 的连接泄漏尾巴
