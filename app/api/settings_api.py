@@ -21,8 +21,8 @@ class SettingsPayload(BaseModel):
 
     download_dir: str | None = None
     concurrency: int | None = Field(default=None, ge=1, le=10)
-    # 保留期分钟数（0=不保留即下载完成即删）；上限 MB（0=不限制）
-    retention_minutes: int | None = Field(default=None, ge=0, le=365 * 24 * 60)
+    # 保留期分钟数
+    retention_minutes: int | None = Field(default=None, ge=1, le=365 * 24 * 60)
     max_download_mb: int | None = Field(default=None, ge=0, le=1024 * 1024)
 
 

@@ -20,6 +20,7 @@ const store = {
   itemsRefresh: new Set(), // 明细为空占位任务的去重补拉（防 item 事件风暴）
   speedPrev: {}, // task_id -> {ts, done} 任务级差分基准
   speed: {}, // task_id -> {speed, eta}
+  limitMb: null, // 单次下载上限（/api/limits）；null=未知（预检跳过，服务端兜底）
 };
 
 function saveLocalCookie(cookie) {
@@ -556,6 +557,19 @@ async function submitDownload() {
   $("download-btn").disabled = true;
   try {
     const { sizes, dirSizes } = collectSizeMaps(items);
+    // 前端预检：与选择条「已选 X 项，共 Y」同一口径（目录用后端子树统计），
+    // 超限直接提示且不发请求；服务端还有权威目录统计与解析后真实树校验兜底
+    if (store.limitMb > 0) {
+      let totalBytes = 0;
+      for (const it of items) {
+        if (it.isDir) totalBytes += dirSizes[it.fid] || 0;
+        else totalBytes += sizes[it.fid] || 0;
+      }
+      if (totalBytes > store.limitMb * 1024 * 1024) {
+        toast(`所选文件共 ${fmtSize(totalBytes)}，超过单次下载上限 ${store.limitMb}MB，请减少勾选后重试`);
+        return;
+      }
+    }
     const body = await postJSON(
       "/api/download",
       {
@@ -720,6 +734,51 @@ function renderTasks() {
   list.forEach((t) => wrap.appendChild(renderTaskCard(t)));
 }
 
+// 链接文案附有效期（服务器签发时刻 + token TTL）；未知时原文返回
+function expiryLabel(base, expiresAt) {
+  if (!expiresAt) return base;
+  // 跨天的到期（保留 24 小时/7 天）带上日期，当天只显示时刻
+  const d = new Date(expiresAt * 1000);
+  const hm = fmtClock(expiresAt);
+  const when = d.toDateString() === new Date().toDateString() ? hm : `${d.getMonth() + 1}月${d.getDate()}日 ${hm}`;
+  return `${base}（有效期至 ${when}）`;
+}
+
+function fmtClock(unixSeconds) {
+  const d = new Date(unixSeconds * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+// 触发任务文件下载：先校验有效期，再 HEAD 探测服务端确有该文件，两者都过
+// 才放行 <a download>。过期/已被清理都提示并刷新任务（重新签发 token），
+// 绝不让浏览器把 4xx 错误响应体存成损坏的下载文件
+async function openTaskFile(url, expiresAt, filename) {
+  if (expiresAt && Date.now() >= expiresAt * 1000) {
+    toast("文件已过期，请重新下载");
+    refreshTasks();
+    return;
+  }
+  let check = null;
+  try {
+    check = await fetch(url, { method: "HEAD" });
+  } catch (_) { /* 网络异常按文件不可用处理 */ }
+  if (!check || !check.ok) {
+    const reason = !check || check.status === 404
+      ? "文件不存在或链接已失效"
+      : check.status === 410 ? "文件已过期" : "文件已被清理";
+    toast(`${reason}，请重新下载`);
+    refreshTasks();
+    return;
+  }
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename || "";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
 function renderTaskCard(t) {
   const card = document.createElement("div");
   card.className = "task-card";
@@ -774,15 +833,16 @@ function renderTaskCard(t) {
   if (RUNNING_STATUSES.has(t.status)) {
     const cancelBtn = document.createElement("button");
     cancelBtn.textContent = "取消";
-    cancelBtn.addEventListener("click", () => taskAction(t.id, "cancel"));
+    cancelBtn.addEventListener("click", () => taskAction(cancelBtn, t.id, "cancel"));
     actions.appendChild(cancelBtn);
   } else if (t.status === "failed") {
     const retryBtn = document.createElement("button");
     retryBtn.textContent = "重试";
-    retryBtn.addEventListener("click", () => taskAction(t.id, "retry"));
+    retryBtn.addEventListener("click", () => taskAction(retryBtn, t.id, "retry"));
     actions.appendChild(retryBtn);
   }
-  // 已完成项：浏览器直接从服务器拉取文件（token 校验绑定会话，须带 ?session=）
+  // 已完成项：浏览器直接从服务器拉取文件（token 校验绑定会话，须带 ?session=）；
+  // 链接附服务器签发的有效期，过期点击直接提示而不发无效请求
   const doneWithFile = (t.items || []).filter((i) => i.status === "done" && i.file_url);
   if (t.status === "done") {
     if (t.zip_url) {
@@ -791,7 +851,11 @@ function renderTaskCard(t) {
       a.className = "task-download-link";
       a.href = `${t.zip_url}?session=${encodeURIComponent(store.me.username)}`;
       a.download = `${t.title || "download"}.zip`;
-      a.textContent = "⬇ 打包下载 ZIP";
+      a.textContent = expiryLabel("⬇ 打包下载 ZIP", t.expires_at);
+      a.addEventListener("click", (e) => {
+        e.preventDefault();
+        openTaskFile(a.href, t.expires_at, a.download);
+      });
       actions.appendChild(a);
     }
     doneWithFile.forEach((item) => {
@@ -799,7 +863,11 @@ function renderTaskCard(t) {
       a.className = "task-download-link";
       a.href = `${item.file_url}?session=${encodeURIComponent(store.me.username)}`;
       a.download = item.name || "";
-      a.textContent = `⬇ ${item.name || "保存到本地"}`;
+      a.textContent = expiryLabel(`⬇ ${item.name || "保存到本地"}`, t.expires_at);
+      a.addEventListener("click", (e) => {
+        e.preventDefault();
+        openTaskFile(a.href, t.expires_at, a.download);
+      });
       actions.appendChild(a);
     });
   }
@@ -807,10 +875,12 @@ function renderTaskCard(t) {
   return card;
 }
 
-async function taskAction(taskId, action) {
-  // 在途守卫：连点不重复发请求（曾因第二击踩在已切状态的任务上误报「任务不存在」）
+async function taskAction(btn, taskId, action) {
+  // 在途/已点守卫：连点直接忽略；请求期间禁用按钮（服务端也会对非法重试
+  // 返回 400），操作完成恢复并由 refreshTasks 重渲染出实际状态
   const key = taskId + ":" + action;
-  if (store.taskBusy.has(key)) return;
+  if (store.taskBusy.has(key) || btn.disabled) return;
+  btn.disabled = true;
   store.taskBusy.add(key);
   try {
     await api(`/api/tasks/${encodeURIComponent(taskId)}/${action}`, { method: "POST" });
@@ -820,6 +890,7 @@ async function taskAction(taskId, action) {
     toast(`操作失败：${err.message}`);
   } finally {
     store.taskBusy.delete(key);
+    btn.disabled = false;
   }
   refreshTasks();
 }
@@ -893,7 +964,7 @@ async function openSettings() {
     const body = await api("/api/settings");
     $("setting-download-dir").value = body.download_dir || "";
     $("setting-concurrency").value = String(body.concurrency || 2);
-    $("setting-retention").value = String(body.retention_minutes ?? 0);
+    $("setting-retention").value = String(body.retention_minutes || 60);
     $("setting-max-download").value = String(body.max_download_mb ?? 0);
     $("settings-message").textContent = "";
     openModal("settings-modal");
@@ -914,12 +985,17 @@ async function saveSettings() {
     msg.textContent = "下载上限需为不小于 0 的整数（0 = 不限制）";
     return;
   }
+  const retention = Number($("setting-retention").value);
+  if (!Number.isInteger(retention) || retention < 1) {
+    msg.textContent = "保留时长需为正整数分钟（「不保留」选项已移除）";
+    return;
+  }
   $("settings-save").disabled = true;
   try {
     await postJSON("/api/settings", {
       download_dir: $("setting-download-dir").value.trim() || "downloads",
       concurrency,
-      retention_minutes: Number($("setting-retention").value) || 0,
+      retention_minutes: retention,
       max_download_mb: maxDownload,
     });
     msg.textContent = "";
@@ -1108,7 +1184,18 @@ async function init() {
   // 断线后 EventSource 浏览器默认自动重连，无需手动处理
 
   refreshCookieStatus();
+  refreshLimits(); // 上限预检数据源（失败静默：服务端仍有权威校验兜底）
   refreshTasks();
+}
+
+// 单次下载上限（MB）：登录后拉取，submitDownload 用「已选」口径即时预检
+async function refreshLimits() {
+  try {
+    const body = await api("/api/limits");
+    store.limitMb = Number(body.max_download_mb) || 0;
+  } catch (_) {
+    store.limitMb = null; // 拉取失败不拦：服务端权威校验兜底
+  }
 }
 
 document.addEventListener("DOMContentLoaded", init);

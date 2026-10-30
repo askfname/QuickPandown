@@ -1,7 +1,8 @@
 """已完成文件的浏览器下载端点：HMAC 签名 token 授权，按会话与任务隔离
 
-资源约束：retention_minutes=0（不保留）时文件在下载响应完成后即删；
->0 时由 sweep_expired_files 周期清扫。多文件任务提供 ZIP 打包端点
+资源约束：服务器副本按保留时长（设置项，正数分钟）由 sweep_expired_files周期清扫；
+删除文件后收拢空的用户名/分享目录。链接本身有时效（token TTL），
+过期访问返回 410「文件已过期，请重新下载」。多文件任务提供 ZIP 打包端点
 """
 
 from __future__ import annotations
@@ -13,19 +14,21 @@ import secrets
 import time
 import zipfile
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 
 from app.config import load_settings, project_root
 from app.engine.paths import sanitize_rel
+from app.engine.tasks import TaskStatus
 
 router = APIRouter(prefix="/api")
 
 TOKEN_TTL_SECONDS = 3600
 
-# 周期清扫的节拍：保留期 >0 时按它定时扫（间隔与保留期解耦）
+# 周期清扫的节拍（间隔与保留期解耦）
 SWEEP_INTERVAL_SECONDS = 600
 
 
@@ -87,57 +90,84 @@ def issue_file_token(secret: bytes, session: str, task_id: str, item_id: str, tt
     return token
 
 
-def file_path_for(session: str, item_path: str) -> Path:
-    """与引擎 _dest_for 同构的落盘路径（download_dir/{session}/...）"""
+def file_path_for(session: str, task_id: str, item_path: str) -> Path:
+    """与引擎 _dest_for 同构的落盘路径（download_dir/{session}/{task_id}/...）"""
     base = Path(load_settings().download_dir)
     if not base.is_absolute():
         base = project_root() / base
     if session:
         base = base / session
-    return base.joinpath(*sanitize_rel(item_path).split("/"))
+    return (base / task_id).joinpath(*sanitize_rel(item_path).split("/"))
 
 
-def sweep_expired_files(root: Path, retention_minutes: int, now: float | None = None) -> int:
-    """按 mtime 删除超过保留期的文件，返回删除数
+def sweep_expired_files(root: Path, tasks: "list[Any]", now: float | None = None) -> tuple[int, int]:
+    """按每个文件自身冻结的到期时刻（keep_until，完成瞬间持久化）删除本地文件，
+    随后把空目录（含空的用户名目录）深→浅收拢。
 
-    只删文件不删目录（保留会话/分享目录结构，空目录不占空间）；
-    retention_minutes<=0 直接跳过（0=不保留的立即删在下载完成后做，不归这里）
+    tasks 为全量任务档案（内存快照 + 历史），文件按落盘
+    download_dir/{session}/{task_id}/... 布局定位；目录里还有任何内容
+    （含新鲜文件）就收拢不动。
+    返回 (删除文件数, 删除目录数)；下载根自身从不删除
     """
-    if retention_minutes <= 0 or not root.exists():
-        return 0
-    cutoff = (now if now is not None else time.time()) - retention_minutes * 60
-    removed = 0
-    for path in root.rglob("*"):
+    if not root.exists():
+        return 0, 0
+    now = now if now is not None else time.time()
+    targets: list[Path] = []
+    for t in tasks or []:
+        for i in t.items:
+            if i.status != "done" or not i.keep_until or i.keep_until >= now:
+                continue
+            parts = sanitize_rel(i.path).split("/")
+            sdir = root / t.session if t.session else root
+            cand = (sdir / t.id).joinpath(*parts)
+            try:
+                if cand.is_file() and cand not in targets:
+                    targets.append(cand)
+            except OSError:
+                pass
+    removed_files = 0
+    for path in targets:
         try:
-            if path.is_file() and path.stat().st_mtime < cutoff:
-                path.unlink()
-                removed += 1
+            path.unlink()
+            removed_files += 1
         except OSError:
             pass  # 单文件失败不阻断清扫（占用/权限问题留给下一轮）
-    return removed
-
-
-def _delete_quiet(path: Path) -> None:
-    try:
-        path.unlink(missing_ok=True)
-    except OSError:
-        pass  # 删除失败不影响下载响应（留给周期清扫兜底）
+    # 空目录收拢： deepest 优先，逐层向上尝试 rmdir（非空即停，零递归风险）
+    removed_dirs = 0
+    dirs = [p for p in root.rglob("*") if p.is_dir()]
+    dirs.sort(key=lambda p: len(p.parts), reverse=True)
+    for directory in dirs:
+        try:
+            directory.rmdir()  # 仅空目录成功
+            removed_dirs += 1
+        except OSError:
+            pass
+    return removed_files, removed_dirs
 
 
 def download_root() -> Path:
-    """解析下载根目录（相对则相对项目根）。"""
+    """解析下载根目录"""
     base = Path(load_settings().download_dir)
     if not base.is_absolute():
         base = project_root() / base
     return base
 
 
-@router.get("/files/{token}")
-async def download_file(token: str, request: Request, session: str = ""):
-    """浏览器直接 GET 下载已完成文件；会话经 ?session= 校验归属，跨会话 404，
+def resolve_item_file(session: str, task_id: str, item_path: str) -> Path | None:
+    """解析文件真实落点（download_dir/{session}/{task_id}/...），不存在返回 None"""
+    path = file_path_for(session, task_id, item_path)
+    try:
+        return path if path.exists() else None
+    except OSError:
+        return None
 
-    不保留模式（retention_minutes=0）：响应完成后立即删除本地文件
-    """
+
+def _resolve_single_download(token: str, request: Request, session: str) -> tuple[Path, str]:
+    """单文件下载的公共校验链：token 过期→410；token/任务/子项无效→404；
+    文件不在盘（被保留期清扫或从未落盘）→410。GET 与 HEAD 探测共用"""
+    already_late = _token_expires_at(token)
+    if already_late is not None and already_late < time.time():
+        raise HTTPException(status_code=410, detail="文件已过期，请重新下载")
     secret = getattr(request.app.state, "secret", b"")
     resolved = verify_file_token(secret, token, session)
     if resolved is None:
@@ -155,28 +185,39 @@ async def download_file(token: str, request: Request, session: str = ""):
     if item is None:
         raise HTTPException(status_code=404, detail="文件不存在或链接已过期")
 
-    path = file_path_for(session, item.path)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="文件不存在或链接已过期")
-
+    path = resolve_item_file(session, task.id, item.path)
+    if path is None:
+        # 已被保留期清扫或从未落盘：与链接过期同口径，提示重新下载
+        raise HTTPException(status_code=410, detail="文件已过期，请重新下载")
     filename = sanitize_rel(item.path).split("/")[-1] or "download.bin"
-    delete_after = load_settings().retention_minutes == 0
+    return path, filename
+
+
+@router.get("/files/{token}")
+async def download_file(token: str, request: Request, session: str = ""):
+    """浏览器直接 GET 下载已完成文件；会话经 ?session= 校验归属，跨会话 404"""
+    path, filename = _resolve_single_download(token, request, session)
     return FileResponse(
         path,
         media_type="application/octet-stream",
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
-        background=_BackgroundUnlink(path) if delete_after else None,
     )
 
 
-class _BackgroundUnlink:
-    """starlette BackgroundTask 等价物：响应发送完成后删除文件（不引额外依赖）"""
+@router.head("/files/{token}")
+async def head_file(token: str, request: Request, session: str = ""):
+    """前端下载前的 HEAD 存在性探测：FastAPI @get 不自动支持 HEAD，需显式注册，
+    只校验不给文件体，404/410 语义与 GET 完全一致"""
+    _resolve_single_download(token, request, session)
+    return Response(status_code=200)
 
-    def __init__(self, path: Path) -> None:
-        self.path = path
 
-    async def __call__(self) -> None:
-        _delete_quiet(self.path)
+def _token_expires_at(token: str) -> float | None:
+    """token 首段即过期时刻（hex 秒值）；非 token 形态返回 None（交由后续校验）"""
+    try:
+        return int(token.split("-", 1)[0], 16)
+    except (ValueError, AttributeError):
+        return None
 
 
 # ---- 多文件打包下载（ZIP）-----------------------------------------------------
@@ -225,12 +266,13 @@ def issue_zip_token(secret: bytes, session: str, task_id: str,
     return token
 
 
-@router.get("/files/{token}/zip")
-async def download_zip(token: str, request: Request, session: str = ""):
-    """多文件打包下载：ZIP_STORED 流式输出（不重复压缩多媒体，省 CPU）
-
-    打包中文件缺失（保留期已清扫）：任务转 failed 提示重新提交，不再哑 404
-    """
+def _resolve_zip_download(token: str, request: Request, session: str,
+                          mark_failed: bool) -> tuple[list[tuple[object, Path]], object]:
+    """打包下载的公共校验链：token 过期→410；token/任务无效→404；
+    某文件不在盘→404（GET 时把任务转 failed 便于重试，HEAD 探测不动任务状态）"""
+    already_late = _token_expires_at(token)
+    if already_late is not None and already_late < time.time():
+        raise HTTPException(status_code=410, detail="文件已过期，请重新下载")
     secret = _zip_token_secret(request)
     resolved = verify_zip_token(secret, token, session)
     if resolved is None:
@@ -250,20 +292,24 @@ async def download_zip(token: str, request: Request, session: str = ""):
     for item in task.items:
         if item.id not in item_ids or item.status != "done":
             continue
-        path = file_path_for(session, item.path)
-        if not path.exists():
-            # 已被保留期清扫或手动删除：如实提示并让任务回到可重试态
-            from app.engine.tasks import TaskStatus
-
-            task.status = TaskStatus.failed
-            task.message = "文件已被清理（超过保留期），请重新提交下载"
-            from app.engine.tasks import _TERMINAL  # noqa: F401  确保状态合法
-
+        path = resolve_item_file(session, task.id, item.path)
+        if path is None:
+            # 已被保留期清扫或手动删除：如实提示（mark_failed 仅真正的下载请求）
+            if mark_failed:
+                task.status = TaskStatus.failed
+                task.message = "文件已被清理（超过保留期），请重新提交下载"
             raise HTTPException(status_code=404, detail="文件已被清理（超过保留期），请重新提交下载")
         pairs.append((item, path))
 
     if not pairs:
-        raise HTTPException(status_code=404, detail="文件不存在或链接已过期")
+        raise HTTPException(status_code=404, detail="文件已过期，请重新下载")
+    return pairs, task
+
+
+@router.get("/files/{token}/zip")
+async def download_zip(token: str, request: Request, session: str = ""):
+    """多文件打包下载：ZIP_STORED 流式输出（不重复压缩多媒体，省 CPU）"""
+    pairs, task = _resolve_zip_download(token, request, session, mark_failed=True)
 
     zip_name = (task.title or "download").strip() or "download"
     headers = {
@@ -273,8 +319,15 @@ async def download_zip(token: str, request: Request, session: str = ""):
         _zip_stream(pairs),
         media_type="application/zip",
         headers=headers,
-        background=_ZipCleanup(pairs) if load_settings().retention_minutes == 0 else None,
     )
+
+
+@router.head("/files/{token}/zip")
+async def head_zip(token: str, request: Request, session: str = ""):
+    """前端打包下载前的 HEAD 存在性探测：只校验、不给文件体，
+    不动任务状态（failed 转换属真正下载请求 GET 的语义）"""
+    _resolve_zip_download(token, request, session, mark_failed=False)
+    return Response(status_code=200)
 
 
 async def _zip_stream(pairs):
@@ -314,14 +367,3 @@ async def _iter_zip(pairs):
     data = await _asyncio.get_event_loop().run_in_executor(None, _first)
     for i in range(0, len(data), 256 * 1024):
         yield data[i : i + 256 * 1024]
-
-
-class _ZipCleanup:
-    """打包响应完成后按不保留模式删除源文件"""
-
-    def __init__(self, pairs) -> None:
-        self.paths = [p for _, p in pairs]
-
-    async def __call__(self) -> None:
-        for p in self.paths:
-            _delete_quiet(p)

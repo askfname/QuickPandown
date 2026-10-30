@@ -53,11 +53,18 @@ async def _lifespan(app: FastAPI):
     engine: TaskEngine = app.state.engine
     app.state.history = engine.load_history()
     try:
+        # 历史档案一次性补齐冻结到期时刻（keep_until）
+        # 按启动时的保留时长定死并落盘，之后的调整只影响新下载文件
+        engine.freeze_history_expiry()
+    except Exception:  # noqa: BLE001 - 补齐失败不阻断启动
+        pass
+    try:
         await engine.sweep_temp_on_startup()
     except Exception:  # noqa: BLE001 - 启动清扫失败不阻断应用
         pass
 
-    # 本地文件保留期清扫：retention_minutes>0 才周期运行；设置变更时重启循环
+    # 本地文件保留期清扫：固定周期运行（按文件冻结的 keep_until 到点删除），
+    # 设置变更时重启循环
     from app.api.files_api import SWEEP_INTERVAL_SECONDS, download_root, sweep_expired_files
 
     sweep_task: asyncio.Task | None = None
@@ -68,13 +75,14 @@ async def _lifespan(app: FastAPI):
 
         async def loop() -> None:
             while not stop.is_set():
-                # 优先读引擎运行时设置（管理员保存即时生效），无引擎回退磁盘设置
-                settings = getattr(engine, "settings", None) or load_settings()
-                if settings.retention_minutes > 0:
-                    try:
-                        sweep_expired_files(download_root(), settings.retention_minutes)
-                    except Exception:  # noqa: BLE001 - 清扫失败不阻断应用
-                        pass
+                try:
+                    # 按每个文件自身冻结的到期时刻清扫（保留时长改动不影响旧文件）
+                    sweep_expired_files(
+                        download_root(),
+                        engine.snapshot(None) + engine.load_history(),
+                    )
+                except Exception:  # noqa: BLE001 - 清扫失败不阻断应用
+                    pass
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=SWEEP_INTERVAL_SECONDS)
                 except asyncio.TimeoutError:

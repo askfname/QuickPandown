@@ -31,6 +31,9 @@ NO_COOKIE_MESSAGE = "需要先设置夸克 Cookie"
 # UI 与下载链接仍能经 tasks.json 历史寻址（tasks_for 会合并历史）。failed 不修剪
 #（retry 需要 Cookie 与待重试子项）。长跑进程里终态任务不再无限堆积
 TERMINAL_TTL_SECONDS = 3600
+# 终态任务的 tasks.json 历史保留期：更老的条目在 persist 落盘/载入时修剪，
+# 防 tasks.json 随时间无限增长
+HISTORY_RETENTION_SECONDS = 7 * 24 * 3600
 # 进度事件节流间隔：on_progress 每个 HTTP 块都会回调，SSE 全量转发会让
 # 总线/前端被高频事件淹没；每 (task, 子项) 至多 ~0.3s 推一次（完成必推）
 PROGRESS_INTERVAL_SECONDS = 0.3
@@ -58,6 +61,11 @@ class SubItem:
     done_bytes: int = 0
     status: str = "waiting"
     error: str | None = None
+    # 下载完成时刻（time.time()）：进度档案与排查依据；持久化进 tasks.json
+    done_at: float | None = None
+    # 冻结的本地到期时刻：下载完成瞬间用【当时】的保留时长算出并持久化。
+    # 之后调整保留时长只影响此后新下载的文件，旧文件的有效期不再漂移
+    keep_until: float | None = None
 
 
 @dataclass
@@ -71,7 +79,8 @@ class Task:
     message: str = ""
     passcode: str = ""
     session: str = ""
-    # 进入终态的时间戳（time.time()）：终态内存修剪的依据；仅内存态，不持久化
+    # 进入终态的时间戳（time.time()）：终态内存修剪与历史保留期的依据，
+    # 随任务持久化进 tasks.json；老数据缺失时由历史的 created_at 回退
     terminal_at: float | None = None
 
 
@@ -207,6 +216,19 @@ class TaskEngine:
             ]
             self._leaves[task.id] = [(sub.id, leaf) for sub, leaf in zip(task.items, leaves)]
             self._pending.pop(task.id, None)
+
+            # 服务端最后一道权威校验：前端大小表可被伪造绕过，树已 walk 到真实叶子大小，
+            # 超限任务直接失败——不转存不下载，零云端临时空间零流量
+            limit_mb = int(self.settings.max_download_mb or 0)
+            if limit_mb > 0:
+                total_bytes = sum(sub.size for sub in task.items)
+                if total_bytes > limit_mb * 1024 * 1024:
+                    raise QuarkApiError(
+                        0,
+                        f"所选文件共 {total_bytes / (1024 * 1024):.0f}MB，"
+                        f"超过单次下载上限 {limit_mb}MB，请减少勾选后重试",
+                    )
+
             self._preparers.pop(task_id, None)
             self._start(task.id, cookie)
         except asyncio.CancelledError:
@@ -217,6 +239,7 @@ class TaskEngine:
                     sub.status = "cancelled"
                     self._publish_item(task, sub)
                 await self._cleanup(task)
+                self._cleanup_local(task)
                 self._finish(task, TaskStatus.cancelled, "已取消")
         except QuarkApiError as exc:
             self._preparers.pop(task_id, None)
@@ -303,6 +326,7 @@ class TaskEngine:
                     sub.status = "cancelled"
                     self._publish_item(task, sub)
             await self._cleanup(task)
+            self._cleanup_local(task)  # 未完成文件不留在盘上（done 文件保留交付）
             self._finish(task, TaskStatus.cancelled, "已取消")
         except QuarkApiError as exc:
             await self._cleanup(task)
@@ -335,6 +359,7 @@ class TaskEngine:
                 sub.status = "cancelled"
                 self._publish_item(task, sub)
             await self._cleanup(task)
+            self._cleanup_local(task)
             self._finish(task, TaskStatus.cancelled, "已取消")
             return
 
@@ -348,6 +373,7 @@ class TaskEngine:
             return
 
         await self._cleanup(task)
+        self._cleanup_local(task)
         self._finish(task, TaskStatus.cancelled, "已取消")
 
     async def retry(self, task_id: str, session: str | None = None) -> bool:
@@ -409,13 +435,18 @@ class TaskEngine:
     # ---- 持久化 ------------------------------------------------------------
 
     def persist(self) -> None:
-        """把终态任务 upsert 进 db_path（按 id 合并既有历史，重启后不丢旧记录）"""
+        """把终态任务 upsert 进 db_path（按 id 合并既有历史，重启后不丢旧记录）
+
+        落盘同时修剪超过 HISTORY_RETENTION_SECONDS 的超期历史（终态任务）：
+        tasks.json 不随时间无限增长；最近条目与本次终态任务正常写入
+        """
         existing: dict[str, dict] = {}
         try:
             data = json.loads(self._db_path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 for raw in data.get("tasks") or []:
-                    if isinstance(raw, dict) and raw.get("id"):
+                    if (isinstance(raw, dict) and raw.get("id")
+                            and not _history_expired(raw)):
                         existing[str(raw["id"])] = raw
         except (OSError, ValueError):
             existing = {}  # 文件缺失或损坏：视作空历史
@@ -431,7 +462,7 @@ class TaskEngine:
         )
 
     def load_history(self) -> list[Task]:
-        """从 db_path 读历史任务；文件缺失、损坏或条目非法时逐条回退"""
+        """从 db_path 读历史任务；过期条目与损坏条目一并跳过（文件缺失逐条回退）"""
         try:
             data = json.loads(self._db_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -439,14 +470,69 @@ class TaskEngine:
         if not isinstance(data, dict):
             return []
         tasks: list[Task] = []
+        now = time.time()
         for raw in data.get("tasks") or []:
-            if not isinstance(raw, dict):
+            if not isinstance(raw, dict) or _history_expired(raw, now):
                 continue
             try:
                 tasks.append(_task_from_dict(raw))
             except (KeyError, TypeError, ValueError):
                 continue
         return tasks
+
+    def freeze_history_expiry(self) -> int:
+        """历史档案一次性补齐冻结到期时刻（keep_until），启动时执行。
+
+        已有 keep_until 的子项跳过；可按 done_at 或落盘文件 mtime 推算的用
+        【当时】保留时长计算并写回 tasks.json
+        """
+        try:
+            data = json.loads(self._db_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return 0
+        if not isinstance(data, dict):
+            return 0
+        window = max(1, self.settings.retention_minutes) * 60
+        changed = 0
+        for raw in data.get("tasks") or []:
+            if not isinstance(raw, dict):
+                continue
+            session = str(raw.get("session") or "")
+            for item in raw.get("items") or []:
+                if not isinstance(item, dict) or item.get("status") != "done":
+                    continue
+                if "keep_until" in item:
+                    continue
+                stamp = float(item.get("done_at") or 0.0)
+                if not stamp:
+                    stamp = self._item_file_mtime(
+                        session, str(raw.get("id") or ""), str(item.get("path") or "")
+                    )
+                item["keep_until"] = stamp + window if stamp else None
+                changed += 1
+        if changed:
+            self._db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._db_path.write_text(
+                json.dumps({"tasks": data.get("tasks") or []}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        return changed
+
+    def _item_file_mtime(self, session: str, task_id: str, rel: str) -> float:
+        """done 子项落盘文件的 mtime（download_dir/{session}/{task_id}/... 布局），查不到返回 0.0"""
+        try:
+            parts = sanitize_rel(rel).split("/")
+        except ValueError:
+            return 0.0
+        base = self._download_base()
+        sdir = base / session if session else base
+        cand = (sdir / task_id).joinpath(*parts)
+        try:
+            if cand.is_file():
+                return cand.stat().st_mtime
+        except OSError:
+            pass
+        return 0.0
 
     # ---- 内部 --------------------------------------------------------------
 
@@ -487,7 +573,7 @@ class TaskEngine:
                 async with semaphore:
                     if flag.is_set():
                         raise asyncio.CancelledError()
-                    dest = self._dest_for(sub, task.session)
+                    dest = self._dest_for(sub, task)
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     sub.status = "downloading"
                     self._publish_item(task, sub)
@@ -510,6 +596,11 @@ class TaskEngine:
                         self._publish_item(task, sub)
                     else:
                         sub.done_bytes = sub.size
+                        sub.done_at = time.time()
+                        # 到期在完成瞬间用当时的保留时长定死并持久化：
+                        # 之后调改设置只对新下载的文件生效
+                        sub.keep_until = sub.done_at + max(
+                            1, self.settings.retention_minutes) * 60
                         sub.status = "done"
                         self._publish_item(task, sub)
 
@@ -523,14 +614,51 @@ class TaskEngine:
         finally:
             await http.aclose()
 
-    def _dest_for(self, sub: SubItem, session: str = "") -> Path:
-        """落盘全路径：download_dir/{session}/（相对则相对 project_root）+ path 分段 sanitize"""
+    def _download_base(self) -> Path:
+        """下载根目录（相对则相对 project_root）"""
         base = Path(self.settings.download_dir)
         if not base.is_absolute():
             base = project_root() / base
-        if session:
-            base = base / session
-        return base.joinpath(*sanitize_rel(sub.path).split("/"))
+        return base
+
+    def _dest_for(self, sub: SubItem, task: Task) -> Path:
+        """落盘全路径：download_dir/{session}/{task_id}/（相对则相对 project_root）+ path 分段 sanitize
+
+        任务目录隔离：同用户不同任务的同名文件互不覆盖、并发互不踩写，
+        也不会被其他任务的取消清理误删
+        """
+        base = self._download_base()
+        if task.session:
+            base = base / task.session
+        return (base / task.id).joinpath(*sanitize_rel(sub.path).split("/"))
+
+    def _cleanup_local(self, task: Task) -> int:
+        """取消收尾：删除本地未完成文件的残留（部分写入/空占位），返回删除数。
+
+        已 done 的子项文件保留（用户可能已经用它的下载链接交付了）；随后从
+        各删除点深→浅收拢空目录（任务目录、已空出的用户名目录一并移除）——
+        rmdir 仅对空目录成功，非空即停（保护其他任务的文件），绝不越过
+        下载根。cloud 临时由 _cleanup 负责，这里只管磁盘
+        """
+        base = self._download_base()
+        removed = 0
+        for sub in task.items:
+            if sub.status == "done":
+                continue
+            dest = self._dest_for(sub, task)
+            try:
+                dest.unlink()
+                removed += 1
+            except OSError:
+                continue  # 占用/权限：残留交给保留期清扫兜底
+            parent = dest.parent
+            while parent != base:
+                try:
+                    parent.rmdir()  # 仅空目录成功；非空即停
+                except OSError:
+                    break
+                parent = parent.parent
+        return removed
 
     async def _cleanup(self, task: Task) -> bool:
         """删除已转存未清理的云端临时文件；失败仅记日志，返回是否全部删除成功。
@@ -580,9 +708,8 @@ class TaskEngine:
         if status is not TaskStatus.failed:
             # failed 保留 Cookie 供 retry；其余终态立即清除
             self._cookies.pop(task.id, None)
-        # 不保留模式（retention=0）的文件删除在交付端做：浏览器响应完成
-        # （files_api 的 background 钩子）后删，绝不在任务 done 时删——否则
-        # 用户点击下载链接时文件已不存在
+        # 云端临时文件删除不压在任务终态上做，交付端也没有清理职责：
+        # 文件由保留期清扫按冻结的 keep_until 到点删除
 
     def _prune_terminal(self) -> None:
         """修剪内存:终态超过 TTL 的 done/cancelled 任务与孤儿取消标志收出内存。
@@ -644,6 +771,14 @@ def _under_any(path: str, dir_paths: set[str]) -> bool:
     return any(path.startswith(d + "/") for d in dir_paths)
 
 
+def _history_expired(raw: dict, now: float | None = None) -> bool:
+    """tasks.json 历史条目是否已超保留期：优先按终态时刻，老数据回退 created_at"""
+    if str(raw.get("status") or "") not in {s.value for s in _TERMINAL}:
+        return False
+    anchor = float(raw.get("terminal_at") or 0.0) or float(raw.get("created_at") or 0.0)
+    return anchor + HISTORY_RETENTION_SECONDS < (now if now is not None else time.time())
+
+
 def _task_to_dict(task: Task) -> dict:
     return {
         "id": task.id,
@@ -654,6 +789,7 @@ def _task_to_dict(task: Task) -> dict:
         "message": task.message,
         "passcode": task.passcode,
         "session": task.session,
+        "terminal_at": task.terminal_at,
         "items": [
             {
                 "id": s.id,
@@ -663,6 +799,8 @@ def _task_to_dict(task: Task) -> dict:
                 "done_bytes": s.done_bytes,
                 "status": s.status,
                 "error": s.error,
+                "done_at": s.done_at,
+                "keep_until": s.keep_until,
             }
             for s in task.items
         ],
@@ -685,6 +823,8 @@ def _task_from_dict(raw: dict) -> Task:
                 done_bytes=int(item.get("done_bytes") or 0),
                 status=str(item.get("status") or "waiting"),
                 error=item.get("error"),
+                done_at=float(item["done_at"]) if item.get("done_at") else None,
+                keep_until=float(item["keep_until"]) if item.get("keep_until") else None,
             )
             for item in raw.get("items") or []
             if isinstance(item, dict)
@@ -692,4 +832,5 @@ def _task_from_dict(raw: dict) -> Task:
         message=str(raw.get("message") or ""),
         passcode=str(raw.get("passcode") or ""),
         session=str(raw.get("session") or ""),
+        terminal_at=float(raw["terminal_at"]) if raw.get("terminal_at") else None,
     )

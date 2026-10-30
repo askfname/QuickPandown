@@ -10,6 +10,7 @@ import json
 from dataclasses import asdict
 from typing import Any
 
+import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -17,8 +18,10 @@ from pydantic import BaseModel, Field
 from app.api.files_api import issue_file_token
 from app.config import load_settings
 from app.engine.tasks import Task, TaskStatus
+from app.api.routes import _user_client
 from app.quark.client import QuarkApiError
 from app.quark.errors import friendly_message
+from app.share_session import share_session
 
 router = APIRouter(prefix="/api")
 
@@ -29,14 +32,19 @@ class DownloadRequest(BaseModel):
     passcode: str = ""
     # 前端已解析出的分享标题：占位任务立即可读，不再显示裸 share_id
     title: str = ""
-    # 勾选项大小表（fid → 字节）与目录叶子累计（fid → 字节）：用于总量预检，
-    # 数据源自浏览端已加载的目录树，服务器转存前即可拒绝超大请求（省流量）
+    # 勾选项大小表（fid → 字节）与目录叶子累计（fid → 字节）：仅作预检参考，
+    # 目录体积以服务端权威统计复核（前端值可被伪造绕过）
     sizes: dict[str, int] = Field(default_factory=dict)
     dir_sizes: dict[str, int] = Field(default_factory=dict)
 
 
 def _engine(request: Request) -> Any:
     return request.app.state.engine
+
+
+def _settings(request: Request) -> Any:
+    """引擎运行时设置优先（管理员保存即时生效），无引擎时读磁盘设置"""
+    return getattr(_engine(request), "settings", None) or load_settings()
 
 
 def _user(request: Request):
@@ -47,7 +55,9 @@ def _serialize_tasks(tasks: list[Task], app: Any) -> list[dict]:
     """dataclasses.asdict + TaskStatus 值字符串化；done 项附文件下载 URL（HMAC token）
 
     多文件任务发打包 token（/api/files/{token}/zip），浏览器一次拿到整个 zip；
-    单文件任务维持单文件 URL
+    单文件任务维持单文件 URL。expires_at 直接读取子项冻结的 keep_until
+    （完成瞬间用当时保留时长定死并持久化）：前端按它展示有效期，清晰的失效
+    时刻不随后续的设置调整漂移
     """
     from app.api.files_api import issue_zip_token
 
@@ -59,7 +69,9 @@ def _serialize_tasks(tasks: list[Task], app: Any) -> list[dict]:
         done_items = [i for i in d["items"] if t.status is TaskStatus.done and i["status"] == "done"]
         for item in d["items"]:
             item["file_url"] = None
+        has_links = False
         if secret and done_items:
+            has_links = True
             if len(done_items) == 1:
                 item = done_items[0]
                 token = issue_file_token(secret, t.session, t.id, item["id"])
@@ -67,38 +79,69 @@ def _serialize_tasks(tasks: list[Task], app: Any) -> list[dict]:
             else:
                 token = issue_zip_token(secret, t.session, t.id, [i["id"] for i in done_items])
                 d["zip_url"] = f"/api/files/{token}/zip"
+        d["expires_at"] = _keep_until(t) if has_links else None
         out.append(d)
     return out
 
 
-def _sum_selected_bytes(items: list[dict], sizes: dict[str, int],
-                        dir_sizes: dict[str, int]) -> int:
-    """勾选字节总量：文件按自身 size，目录按已加载叶子累计（与前端同口径）"""
+def _keep_until(task: Task) -> float | None:
+    """展示/点击用的到期时刻 = 各 done 子项冻结值的最大值（持久化，不重算）。
+
+    历史数据补不出冻结值（keep_until 为空）时返回 None——前端不展示有效期，
+    下载由服务器端点的存在性校验把关
+    """
+    stamps = [i.keep_until for i in task.items if i.status == "done" and i.keep_until]
+    return max(stamps) if stamps else None
+
+
+async def _selected_bytes_authoritative(items: list[dict], *, share_id: str,
+                                        passcode: str, client: Any,
+                                        claimed_sizes: dict[str, int],
+                                        claimed_dir_sizes: dict[str, int]) -> int:
+    """勾选字节总量：文件按前端报值（转存前服务器拿不到单文件权威值），
+    目录以 share_session.subtree_stats 的权威统计复核（防伪造 dir_sizes 绕过）。
+
+    权威统计失败（分享需提取码、断网等）退回前端报值继续预检——不阻断主
+    流程，引擎解析时还有一道真实叶子大小校验兜底
+    """
     total = 0
-    dir_paths = []
+    dir_fids = [str(it.get("fid")) for it in items if it.get("isDir")]
+    for fid in dict.fromkeys(dir_fids):  # 去重保序
+        try:
+            _, bytes_total = await share_session.subtree_stats(
+                share_id, fid, passcode, client=client
+            )
+        except (QuarkApiError, httpx.HTTPError, OSError):
+            bytes_total = int(claimed_dir_sizes.get(fid, 0))
+        total += bytes_total
     for it in items:
-        if it.get("isDir"):
-            dir_paths.append(str(it.get("fid")))
-        else:
-            total += int(sizes.get(str(it.get("fid")), 0))
-    if dir_paths:
-        # 目录的叶子大小由前端汇总传入（dir_sizes[fid]）；未加载目录按 0 计
-        for fid in dir_paths:
-            total += int(dir_sizes.get(fid, 0))
-        # 目录可能嵌套：dir_sizes 里已含子目录叶子，去重交给前端汇总口径
+        if not it.get("isDir"):
+            total += int(claimed_sizes.get(str(it.get("fid")), 0))
     return total
+
+
+@router.get("/limits")
+async def limits(request: Request) -> dict:
+    """登录用户可读的资源限制（前端提交前按「已选」口径预检的数据源）"""
+    return {"max_download_mb": getattr(_settings(request), "max_download_mb", 0)}
 
 
 @router.post("/download")
 async def download(payload: DownloadRequest, request: Request) -> dict:
     engine = _engine(request)
     user = _user(request)
-    # 单次下载总量预检：超限直接拒绝（转存前拦截，不占云端临时空间与流量）
-    # 读引擎运行时设置（管理员保存后立即生效），无引擎时读磁盘设置
-    settings = getattr(engine, "settings", None) or load_settings()
-    limit_mb = getattr(settings, "max_download_mb", 0)
+    # 单次下载总量预检：目录体积走服务端权威统计（share_session 30 分钟 TTL 缓存，前端统计请求已拉过 → 直接命中）
+    # 超限拒绝在转存前拦截，不占云端临时空间与流量，也不建任务
+    limit_mb = getattr(_settings(request), "max_download_mb", 0)
     if limit_mb > 0:
-        total = _sum_selected_bytes(payload.items, payload.sizes, payload.dir_sizes)
+        total = await _selected_bytes_authoritative(
+            payload.items,
+            share_id=payload.share_id,
+            passcode=payload.passcode,
+            client=_user_client(request),
+            claimed_sizes=payload.sizes,
+            claimed_dir_sizes=payload.dir_sizes,
+        )
         if total > limit_mb * 1024 * 1024:
             return {
                 "ok": False,

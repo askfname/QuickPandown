@@ -23,16 +23,18 @@ class Settings:
     download_dir: str = "downloads"
     concurrency: int = 2
     temp_dir_name: str = "QuickPandownTemp"
-    # 本地文件保留分钟数：0=不保留（浏览器下载完成后立即删除服务器副本），
-    # >0 时由后台清扫按文件 mtime 删过期文件
-    retention_minutes: int = 0
+    # 本地文件保留分钟数：每个文件的到期时刻在其下载完成瞬间用【当时】的
+    # 该值定死（keep_until）并持久化，后台按冻结值到点删除；保存链路强制 ≥1
+    retention_minutes: int = 60
     # 单次下载总量上限（MB）：0=不限制；按勾选文件大小总和预检，超限拒绝建任务
     max_download_mb: int = 0
 
     def normalize(self) -> None:
-        """非法值回退默认（负数保留期/上限均视为未配置）"""
-        if self.retention_minutes < 0:
-            self.retention_minutes = 0
+        """负数下载总量上限视为不限制。
+
+        保留期不做改写兜底（系统已重新部署、无 0 旧数据；保存链路与
+        API 校验强制 ≥1），拿到什么用什么
+        """
         if self.max_download_mb < 0:
             self.max_download_mb = 0
 

@@ -134,13 +134,13 @@
     <div class="setting-row">
       <label for="setting-retention">本地文件保留</label>
       <select id="setting-retention">
-        <option value="0">不保留（下载后立即删除）</option>
-        <option value="10">10 分钟</option>
-        <option value="60">1 小时</option>
+        <option value="30">30 分钟</option>
+        <option value="60" selected>1 小时</option>
         <option value="1440">24 小时</option>
         <option value="10080">7 天</option>
       </select>
     </div>
+    <p class="setting-tip" id="retention-tip">服务器副本保留一段时间供浏览器下载，到期自动清理。</p>
     <div class="setting-row">
       <label for="setting-max-download">单次下载上限（MB，0 不限）</label>
       <input id="setting-max-download" type="number" min="0" step="100" placeholder="0">

@@ -171,6 +171,7 @@ main { max-width: 960px; margin: 16px auto; padding: 0 16px; display: flex; flex
 .setting-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
 .setting-row label { flex: none; width: 130px; color: var(--muted); }
 .setting-row input[type="text"], .setting-row input[type="number"] { flex: 1; }
+.setting-tip { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
 .checkbox-row { display: flex; gap: 6px; align-items: center; width: auto !important; color: var(--text) !important; }
 
 /* Toast */
