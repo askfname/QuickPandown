@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>快客盘 QuickPandown</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="app-title">⚡ 快客盘 <small>QuickPandown</small></span>
+  <div class="topbar-actions">
+    <button id="cookie-badge" class="badge st-none" title="点击查看 Cookie 设置">● Cookie 未设置</button>
+    <button id="invites-btn" class="ghost-btn hidden" title="管理邀请码（仅管理员可见）">邀请码管理</button>
+    <button id="settings-btn" class="ghost-btn hidden">⚙ 设置</button>
+    <span id="whoami" class="whoami"></span>
+    <button id="logout-btn" class="ghost-btn">退出登录</button>
+  </div>
+</header>
+
+<main>
+  <!-- 管理员专属：仅承载在线统计；邀请码管理在顶部按钮的弹窗里。普通用户由 JS 移除 -->
+  <section id="admin-panel" class="panel admin-panel hidden">
+    <div class="admin-stats">
+      <div class="stat-box"><span class="stat-num" id="stat-online">-</span><span class="stat-label">在线用户</span></div>
+      <div class="stat-box"><span class="stat-num" id="stat-downloading">-</span><span class="stat-label">正在下载</span></div>
+    </div>
+  </section>
+
+  <section class="panel parse-panel">
+    <textarea id="url-input" rows="3"
+      placeholder="粘贴包含 pan.quark.cn/s/... 的分享链接（支持多行文本，自动识别链接与提取码）"></textarea>
+    <div class="parse-row">
+      <button id="parse-btn" class="primary">解析</button>
+      <div id="passcode-row" class="passcode-row hidden">
+        <label for="passcode-input">提取码：</label>
+        <input id="passcode-input" maxlength="16" placeholder="输入提取码">
+        <button id="passcode-ok" class="primary">确定</button>
+      </div>
+      <span id="parse-message" class="hint"></span>
+    </div>
+    <div id="share-title" class="share-title"></div>
+  </section>
+
+  <section class="panel tree-panel">
+    <div class="tree-toolbar">
+      <button id="select-all-btn">全选</button>
+      <button id="invert-btn">反选</button>
+      <select id="type-filter" title="按类型筛选">
+        <option value="">全部类型</option>
+        <option value="video">视频</option>
+        <option value="audio">音频</option>
+        <option value="image">图片</option>
+        <option value="doc">文档</option>
+        <option value="archive">压缩包</option>
+        <option value="other">其他</option>
+      </select>
+      <label class="size-filter">大小 ≥
+        <input id="size-filter" type="number" min="0" step="any" placeholder="MB"> MB
+      </label>
+    </div>
+    <div id="tree" class="tree">
+      <div class="tree-empty">解析后在此显示文件列表</div>
+    </div>
+  </section>
+
+  <section id="selected-bar" class="selected-bar">
+    <span>已选 <b id="selected-count">0</b> 项，共 <b id="selected-size">0 B</b></span>
+    <button id="download-btn" class="primary">下载所选</button>
+  </section>
+
+  <section class="panel tasks-panel">
+    <h2>下载任务</h2>
+    <div id="tasks" class="tasks">
+      <div class="tasks-empty">暂无任务</div>
+    </div>
+  </section>
+</main>
+
+<div id="cookie-modal" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-head">
+      <h3>设置夸克 Cookie</h3>
+      <button class="modal-close" title="关闭">✕</button>
+    </div>
+    <p class="modal-tip">下载需要夸克账号 Cookie，<b>仅保存到本地浏览器（localStorage），不上传到服务器存储</b>；每位用户使用各自账号互不影响。</p>
+    <ol class="guide">
+      <li>浏览器打开 <b>pan.quark.cn/list</b> 并登录（确认右上角显示头像）</li>
+      <li>按 <b>F12</b> 打开开发者工具</li>
+      <li>切换到 <b>Network（网络）</b> 标签</li>
+      <li>刷新页面</li>
+      <li>点击任一发往 <b>drive-pc.quark.cn</b> 的请求</li>
+      <li>在 <b>请求标头</b> 中找到 <b>Cookie</b> 一行</li>
+      <li>复制整串 Cookie，粘贴到下面</li>
+    </ol>
+    <textarea id="cookie-input" rows="4" placeholder="粘贴整串 Cookie"></textarea>
+    <div class="modal-actions">
+      <button id="cookie-save" class="primary">保存并校验</button>
+      <span id="cookie-message" class="hint"></span>
+    </div>
+  </div>
+</div>
+
+<div id="invites-modal" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-head">
+      <h3>邀请码管理</h3>
+      <button class="modal-close" title="关闭">✕</button>
+    </div>
+    <p class="modal-tip">邀请码仅限注册新用户使用一次；已使用的邀请码不可删除。</p>
+    <div class="invite-add-row">
+      <textarea id="invite-input" rows="2" placeholder="输入邀请码，每行一个（支持批量）"></textarea>
+      <button id="invite-add" class="primary">批量添加</button>
+    </div>
+    <div id="invite-list" class="invite-list"></div>
+  </div>
+</div>
+
+<div id="settings-modal" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-head">
+      <h3>设置</h3>
+      <button class="modal-close" title="关闭">✕</button>
+    </div>
+    <div class="setting-row">
+      <label for="setting-download-dir">下载目录</label>
+      <input id="setting-download-dir" type="text" placeholder="downloads">
+    </div>
+    <div class="setting-row">
+      <label for="setting-concurrency">并发数（1–10）</label>
+      <input id="setting-concurrency" type="number" min="1" max="10" step="1">
+    </div>
+    <div class="setting-row">
+      <label for="setting-retention">本地文件保留</label>
+      <select id="setting-retention">
+        <option value="0">不保留（下载后立即删除）</option>
+        <option value="10">10 分钟</option>
+        <option value="60">1 小时</option>
+        <option value="1440">24 小时</option>
+        <option value="10080">7 天</option>
+      </select>
+    </div>
+    <div class="setting-row">
+      <label for="setting-max-download">单次下载上限（MB，0 不限）</label>
+      <input id="setting-max-download" type="number" min="0" step="100" placeholder="0">
+    </div>
+    <div class="modal-actions">
+      <button id="settings-save" class="primary">保存</button>
+      <span id="settings-message" class="hint"></span>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

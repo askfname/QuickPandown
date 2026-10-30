@@ -1,0 +1,26 @@
+# ==== 运行数据与凭据 ====
+data/*
+!data/.gitkeep
+
+# ==== 用户下载产物 ====
+downloads/
+
+# ==== Python ====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ==== 测试与本地工具 ====
+.pytest_cache/
+.benchmarks/
+.coverage
+htmlcov/
+tests/
+
+# ==== 编辑器/系统 ====
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store

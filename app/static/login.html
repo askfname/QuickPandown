@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>快客盘 QuickPandown — 登录</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body class="login-body">
+  <div class="login-card">
+    <h1 class="login-title">⚡ 快客盘 QuickPandown</h1>
+
+    <div class="tabs">
+      <button id="tab-login" class="tab active">登录</button>
+      <button id="tab-register" class="tab">注册</button>
+    </div>
+
+    <!-- 登录表单 -->
+    <form id="login-form" class="login-form">
+      <label>用户名
+        <input id="login-username" autocomplete="username" required>
+      </label>
+      <label>密码
+        <input id="login-password" type="password" autocomplete="current-password" required>
+      </label>
+      <label>验证码
+        <span class="captcha-row">
+          <input id="login-captcha-input" maxlength="4" autocomplete="off" required>
+          <img id="login-captcha-img" class="captcha-img" title="看不清？点击刷新">
+        </span>
+      </label>
+      <button type="submit" id="login-btn" class="primary">登录</button>
+      <div id="login-message" class="hint"></div>
+    </form>
+
+    <!-- 注册表单 -->
+    <form id="register-form" class="login-form hidden">
+      <label>用户名
+        <input id="reg-username" autocomplete="username" required>
+      </label>
+      <label>邮箱
+        <input id="reg-email" type="email" autocomplete="email" required>
+      </label>
+      <label>密码（至少 8 位）
+        <input id="reg-password" type="password" autocomplete="new-password" required>
+      </label>
+      <label>邀请码
+        <input id="reg-invite" required>
+      </label>
+      <label>验证码
+        <span class="captcha-row">
+          <input id="reg-captcha-input" maxlength="4" autocomplete="off" required>
+          <img id="reg-captcha-img" class="captcha-img" title="看不清？点击刷新">
+        </span>
+      </label>
+      <button type="submit" id="register-btn" class="primary">注册并登录</button>
+      <div id="register-message" class="hint"></div>
+    </form>
+  </div>
+  <script src="/login.js"></script>
+</body>
+</html>
