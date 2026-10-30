@@ -28,15 +28,19 @@ class Settings:
     retention_minutes: int = 60
     # 单次下载总量上限（MB）：0=不限制；按勾选文件大小总和预检，超限拒绝建任务
     max_download_mb: int = 0
+    # 磁盘预留空间（MB）：可用空间低于该值时，新下载任务排队等待；0=关闭守门
+    reserve_disk_mb: int = 1024
 
     def normalize(self) -> None:
-        """负数下载总量上限视为不限制。
+        """负数上限/预留空间按不限制或关闭守门处理。
 
         保留期不做改写兜底（系统已重新部署、无 0 旧数据；保存链路与
         API 校验强制 ≥1），拿到什么用什么
         """
         if self.max_download_mb < 0:
             self.max_download_mb = 0
+        if self.reserve_disk_mb < 0:
+            self.reserve_disk_mb = 0
 
 
 def _settings_path() -> Path:

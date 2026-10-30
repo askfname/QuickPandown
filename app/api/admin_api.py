@@ -95,3 +95,34 @@ async def stats(request: Request) -> dict:
         if t.session and t.status.value in ("transferring", "downloading")
     }
     return {"online_users": online, "downloading_users": len(downloading)}
+
+
+@router.get("/disk")
+async def disk_space(request: Request) -> dict:
+    """磁盘监控：已用/剩余空间、预留值与当前是否触发排队"""
+    engine = request.app.state.engine
+    status = getattr(engine, "disk_status", None)
+    if callable(status):
+        try:
+            return status()
+        except OSError:
+            pass  # 探测失败时走下面的兜底
+
+    # 引擎替身（测试/嵌入场景）兜底：按当前设置探测下载卷
+    from pathlib import Path
+
+    from app.config import load_settings, project_root
+    from app.engine.disk import disk_snapshot
+
+    settings = getattr(engine, "settings", None) or load_settings()
+    path = Path(settings.download_dir)
+    if not path.is_absolute():
+        path = project_root() / path
+    try:
+        return disk_snapshot(path, reserve_mb=int(settings.reserve_disk_mb or 0))
+    except OSError:
+        return {
+            "total_bytes": 0, "used_bytes": 0, "free_bytes": 0,
+            "reserve_bytes": int(settings.reserve_disk_mb or 0) * 1024 * 1024,
+            "inflight_bytes": 0, "available_bytes": 0, "low": False,
+        }

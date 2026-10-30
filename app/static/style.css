@@ -139,6 +139,24 @@ main { max-width: 960px; margin: 16px auto; padding: 0 16px; display: flex; flex
 .st-failed { background: #fee2e2; color: var(--danger); }
 .st-cancelled { background: #fef3c7; color: var(--warn); }
 .task-message { margin-top: 4px; color: var(--danger); font-size: 12px; word-break: break-all; }
+/* 磁盘空间不足排队：警告符号 + 警示色 */
+.task-card.disk-low { border-color: #f59e0b; background: #fffbeb; }
+.task-status.disk-low { background: #fef3c7; color: #b45309; }
+.task-message.warn {
+  color: #b45309; background: #fff7ed; border: 1px solid #fcd34d;
+  border-radius: 6px; padding: 5px 8px;
+}
+/* 磁盘不足警告横幅：仅空间不足时显示，可手动关闭 */
+.disk-alert {
+  display: flex; align-items: center; gap: 10px; margin-top: 10px;
+  padding: 10px 12px; border: 1px solid #fcd34d; border-radius: 8px;
+  background: #fffbeb; color: #b45309; font-size: 13px; font-weight: 600;
+}
+.disk-alert-close {
+  margin-left: auto; padding: 0 2px; border: none; background: none;
+  color: #b45309; font-size: 18px; line-height: 1; cursor: pointer;
+}
+.disk-alert-close:hover { color: #92400e; }
 .task-progress {
   margin-top: 6px; height: 6px; background: #eef1f4;
   border-radius: 3px; overflow: hidden;
@@ -215,13 +233,15 @@ main { max-width: 960px; margin: 16px auto; padding: 0 16px; display: flex; flex
 /* ---------- 管理面板 ---------- */
 .admin-panel { border: 1px solid #dbe4f0; background: #f8fafd; }
 .admin-title { margin: 14px 0 8px; font-size: 15px; }
-.admin-stats { display: flex; gap: 16px; }
+.admin-stats { display: flex; gap: 16px; flex-wrap: wrap; }
 .stat-box {
-  flex: 1; background: #fff; border: 1px solid #dbe4f0; border-radius: 10px;
+  flex: 1 1 140px; background: #fff; border: 1px solid #dbe4f0; border-radius: 10px;
   padding: 12px; text-align: center;
 }
 .stat-num { display: block; font-size: 26px; font-weight: 700; color: #2563eb; }
 .stat-label { font-size: 12px; color: #667; }
+#disk-free-box.disk-low { border-color: #f59e0b; background: #fff7ed; }
+#disk-free-box.disk-low .stat-num { color: #b45309; }
 .invite-add-row { display: flex; gap: 8px; align-items: flex-start; }
 .invite-add-row textarea { flex: 1; }
 .invite-list { margin-top: 10px; display: flex; flex-direction: column; gap: 4px; }

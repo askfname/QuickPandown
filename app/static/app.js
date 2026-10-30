@@ -23,6 +23,9 @@ const store = {
   limitMb: null, // 单次下载上限（/api/limits）；null=未知（预检跳过，服务端兜底）
 };
 
+// 管理员关闭磁盘不足横幅后，本次页面会话不再提示（刷新页面恢复）
+let diskAlertDismissed = false;
+
 function saveLocalCookie(cookie) {
   store.cookie = cookie || "";
   if (store.cookie) localStorage.setItem("qp_cookie", store.cookie);
@@ -634,6 +637,7 @@ function handleEvent(ev) {
     if (t) {
       t.status = ev.status;
       if (ev.message != null) t.message = ev.message;
+      if (ev.disk_low != null) t.disk_low = !!ev.disk_low;
     }
     if (!RUNNING_STATUSES.has(ev.status)) {
       delete store.speed[ev.task_id];
@@ -782,6 +786,7 @@ async function openTaskFile(url, expiresAt, filename) {
 function renderTaskCard(t) {
   const card = document.createElement("div");
   card.className = "task-card";
+  if (t.disk_low) card.classList.add("disk-low");
 
   const head = document.createElement("div");
   head.className = "task-head";
@@ -791,6 +796,7 @@ function renderTaskCard(t) {
   head.appendChild(title);
   const status = document.createElement("span");
   status.className = `task-status st-${t.status}`;
+  if (t.disk_low) status.classList.add("disk-low");
   status.textContent = STATUS_TEXT[t.status] || t.status;
   head.appendChild(status);
   card.appendChild(head);
@@ -799,7 +805,9 @@ function renderTaskCard(t) {
     // queued 也显示：占位任务「正在解析目录…」要立即可见（下载已响应、解析后台进行）
     const msg = document.createElement("div");
     msg.className = "task-message";
-    msg.textContent = t.message;
+    // 磁盘守门排队：警告符号 + 警示色突出显示，直到空间释放自动恢复
+    msg.textContent = t.disk_low ? `⚠ ${t.message}` : t.message;
+    if (t.disk_low) msg.classList.add("warn");
     card.appendChild(msg);
   }
 
@@ -970,6 +978,7 @@ async function openSettings() {
     $("setting-concurrency").value = String(body.concurrency || 2);
     $("setting-retention").value = String(body.retention_minutes || 60);
     $("setting-max-download").value = String(body.max_download_mb ?? 0);
+    $("setting-reserve-disk").value = String(body.reserve_disk_mb ?? 1024);
     $("settings-message").textContent = "";
     openModal("settings-modal");
   } catch (err) {
@@ -989,6 +998,11 @@ async function saveSettings() {
     msg.textContent = "下载上限需为不小于 0 的整数（0 = 不限制）";
     return;
   }
+  const reserveDisk = Number($("setting-reserve-disk").value);
+  if (!Number.isInteger(reserveDisk) || reserveDisk < 0) {
+    msg.textContent = "预留磁盘空间需为不小于 0 的整数（0 = 关闭守门）";
+    return;
+  }
   const retention = Number($("setting-retention").value);
   if (!Number.isInteger(retention) || retention < 1) {
     msg.textContent = "保留时长需为正整数分钟（「不保留」选项已移除）";
@@ -1001,10 +1015,12 @@ async function saveSettings() {
       concurrency,
       retention_minutes: retention,
       max_download_mb: maxDownload,
+      reserve_disk_mb: reserveDisk,
     });
     msg.textContent = "";
     closeModal("settings-modal");
     toast("设置已保存");
+    refreshDiskStats(); // 预留值变化后立即刷新管理员磁盘提示
   } catch (err) {
     msg.textContent = `保存失败：${err.message}`;
   } finally {
@@ -1049,9 +1065,12 @@ async function loadAdminPanel() {
   if (invBtn) invBtn.classList.remove("hidden");
   const settingsBtn = $("settings-btn");
   if (settingsBtn) settingsBtn.classList.remove("hidden");
-  await refreshOnlineStats();
-  // 在线统计 30 秒轮询
-  setInterval(refreshOnlineStats, 30000);
+  await Promise.all([refreshOnlineStats(), refreshDiskStats()]);
+  // 在线统计与磁盘用量 30 秒轮询
+  setInterval(() => {
+    refreshOnlineStats();
+    refreshDiskStats();
+  }, 30000);
 }
 
 async function refreshInvites() {
@@ -1127,6 +1146,34 @@ async function refreshOnlineStats() {
   } catch (_) { /* 统计失败不打扰 */ }
 }
 
+async function refreshDiskStats() {
+  // 仅管理员面板调用：已用/剩余空间与空间不足警告横幅
+  try {
+    const body = await api("/api/admin/disk");
+    $("stat-disk-used").textContent = fmtSize(body.used_bytes || 0);
+    $("stat-disk-free").textContent = fmtSize(body.free_bytes || 0);
+    const box = $("disk-free-box");
+    if (box) box.classList.toggle("disk-low", !!body.low);
+    const hint = $("disk-hint");
+    if (!hint) return;
+    if (!body.low) {
+      hint.classList.add("hidden"); // 空间恢复即收起横幅
+      return;
+    }
+    const text = $("disk-hint-text");
+    if (text) {
+      text.textContent =
+        `⚠ 可用空间低于预留值（${fmtSize(body.reserve_bytes || 0)}），新下载将排队等待`;
+    }
+    if (!diskAlertDismissed) hint.classList.remove("hidden");
+  } catch (_) { /* 磁盘统计失败不打扰 */ }
+}
+
+function dismissDiskAlert() {
+  diskAlertDismissed = true;
+  $("disk-hint").classList.add("hidden");
+}
+
 async function openInvitesModal() {
   // 邀请码管理常驻弹窗入口：点击才拉取并渲染列表（主页不挂长列表）
   openModal("invites-modal");
@@ -1177,6 +1224,7 @@ async function init() {
   // 管理面板 + 邀请码弹窗入口（普通用户节点会被移除）
   $("invite-add").addEventListener("click", addInvites);
   $("invites-btn").addEventListener("click", openInvitesModal);
+  $("disk-hint-close").addEventListener("click", dismissDiskAlert);
   await loadAdminPanel();
 
   const es = new EventSource(`/api/events?session=${encodeURIComponent(store.me.username)}`);

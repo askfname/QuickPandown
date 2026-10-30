@@ -15,6 +15,7 @@ from typing import Any, Callable
 import httpx
 
 from app.config import Settings, project_root
+from app.engine.disk import disk_usage_bytes, snapshot_from_usage
 from app.engine.downloader import download_file
 from app.engine.paths import sanitize_rel
 from app.quark import transfer
@@ -37,6 +38,10 @@ HISTORY_RETENTION_SECONDS = 7 * 24 * 3600
 # 进度事件节流间隔：on_progress 每个 HTTP 块都会回调，SSE 全量转发会让
 # 总线/前端被高频事件淹没；每 (task, 子项) 至多 ~0.3s 推一次（完成必推）
 PROGRESS_INTERVAL_SECONDS = 0.3
+# 排队任务磁盘复查间隔：即使未收到监控唤醒，也定期自查，避免永久挂起
+DISK_RECHECK_SECONDS = 2.0
+# 磁盘监控轮询间隔：空间释放后及时叫醒排队任务
+DISK_MONITOR_INTERVAL_SECONDS = 5.0
 
 
 class TaskStatus(str, Enum):
@@ -82,6 +87,8 @@ class Task:
     # 进入终态的时间戳（time.time()）：终态内存修剪与历史保留期的依据，
     # 随任务持久化进 tasks.json；老数据缺失时由历史的 created_at 回退
     terminal_at: float | None = None
+    # 是否因磁盘空间不足排队（前端据此显示警告符号与警示色）
+    disk_low: bool = False
 
 
 class TaskEngine:
@@ -127,6 +134,8 @@ class TaskEngine:
         # 超出的任务留在 queued 态排队等候。Condition 自带独立锁，wait 期间自动放行
         self._gate: asyncio.Condition = asyncio.Condition()
         self._active_downloads = 0
+        # 已准入任务的预估待写入字节：并发任务同时下载时仍为磁盘保留余量
+        self._reserved_bytes = 0
 
     # ---- 创建 / 查询 -------------------------------------------------------
 
@@ -271,6 +280,7 @@ class TaskEngine:
                 message=t.message,
                 passcode=t.passcode,
                 session=t.session,
+                disk_low=t.disk_low,
             )
             for t in self._tasks.values()
             if session is None or t.session == session
@@ -290,7 +300,8 @@ class TaskEngine:
     async def run(self, task_id: str) -> None:
         """单任务主流程：queued 排队 → transferring → downloading → cleaning → 终态
 
-        开跑前先过任务级全局并发闸：超过设置的并发数时在 queued 态排队等候，避免超发网盘请求
+        开跑前先过任务级闸门：并发已满或磁盘可用空间不足时保持 queued 等待，
+        磁盘准入按本任务待写入字节预留，避免并发任务同时挤爆磁盘
         """
         task = self._tasks.get(task_id)
         if task is None or task.status is not TaskStatus.queued:
@@ -298,19 +309,30 @@ class TaskEngine:
 
         flag = self._cancel_flags[task_id]
         acquired = False
+        reserved = 0
         try:
             try:
+                reserved = self._pending_bytes(task)
                 async with self._gate:
-                    while (not flag.is_set()
-                           and self._active_downloads >= max(1, self.settings.concurrency)):
-                        task.message = "正在排队等候（下载并发已满）…"
-                        self._publish_task(task)
-                        await self._gate.wait()
+                    while not flag.is_set():
+                        if self._active_downloads >= max(1, self.settings.concurrency):
+                            self._set_wait_message(
+                                task, "正在排队等候（下载并发已满）…", False
+                            )
+                        elif not self._disk_allows(reserved):
+                            self._set_wait_message(
+                                task, self._disk_wait_message(reserved), True
+                            )
+                        else:
+                            self._active_downloads += 1
+                            self._reserved_bytes += reserved
+                            acquired = True
+                            break
+                        await self._wait_gate()
                     if flag.is_set():
                         raise asyncio.CancelledError()
-                    self._active_downloads += 1
-                    acquired = True
 
+                task.disk_low = False
                 if flag.is_set():
                     raise asyncio.CancelledError()
                 await self._transfer(task, flag)
@@ -342,9 +364,10 @@ class TaskEngine:
                     )
             finally:
                 if acquired:
-                    # 释放槽位并叫醒排队中的 runner 重新抢（持锁期间改计数，无竞态）
+                    # 释放槽位/磁盘预留并叫醒排队中的 runner 重新抢（持锁期间改计数，无竞态）
                     async with self._gate:
                         self._active_downloads -= 1
+                        self._reserved_bytes = max(0, self._reserved_bytes - reserved)
                         self._gate.notify_all()
         except asyncio.CancelledError:
             if not acquired and (task.status in _TERMINAL or flag.is_set()):
@@ -655,6 +678,65 @@ class TaskEngine:
             base = project_root() / base
         return base
 
+    # ---- 磁盘守门 ----------------------------------------------------------
+
+    def disk_status(self) -> dict:
+        """磁盘用量快照（管理员页展示与准入判断共用）"""
+        return snapshot_from_usage(
+            *disk_usage_bytes(self._download_base()),
+            reserve_mb=int(self.settings.reserve_disk_mb or 0),
+            inflight_bytes=self._reserved_bytes,
+        )
+
+    async def notify_disk_changed(self) -> None:
+        """磁盘空间或预留设置变化时，叫醒排队任务重新评估"""
+        async with self._gate:
+            self._gate.notify_all()
+
+    def _pending_bytes(self, task: Task) -> int:
+        """本任务待写入磁盘的预估字节：扣除已 done 子项与已有 .part 续传部分"""
+        total = 0
+        for sub in task.items:
+            if sub.status == "done":
+                continue
+            remaining = max(0, int(sub.size or 0))
+            try:
+                dest = self._dest_for(sub, task)
+                part = dest.with_name(dest.name + ".part")
+                if part.is_file():
+                    remaining = max(0, remaining - part.stat().st_size)
+            except OSError:
+                pass
+            total += remaining
+        return total
+
+    def _disk_allows(self, required: int) -> bool:
+        """可用空间（扣除在途预留）减去管理员预留值后，是否容纳本任务"""
+        try:
+            status = self.disk_status()
+        except OSError:
+            return True  # 统计失败不阻断下载
+        return status["available_bytes"] - status["reserve_bytes"] >= required
+
+    def _disk_wait_message(self, required: int) -> str:
+        """排队提示只说明状态与所需空间，其余明细留给管理员面板展示"""
+        return f"磁盘空间不足，本任务需 {_fmt_bytes(required)}；已排队等待空间释放…"
+
+    def _set_wait_message(self, task: Task, message: str, disk_low: bool) -> None:
+        """排队提示去重：避免监控轮询时重复推送同一状态"""
+        if task.message == message and task.disk_low == disk_low:
+            return
+        task.message = message
+        task.disk_low = disk_low
+        self._publish_task(task)
+
+    async def _wait_gate(self) -> None:
+        """等待闸门变化；超时后自查一次，监控失效也不会永久排队"""
+        try:
+            await asyncio.wait_for(self._gate.wait(), timeout=DISK_RECHECK_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+
     def _dest_for(self, sub: SubItem, task: Task) -> Path:
         """落盘全路径：download_dir/{session}/{task_id}/（相对则相对 project_root）+ path 分段 sanitize
 
@@ -728,11 +810,13 @@ class TaskEngine:
     def _set_status(self, task: Task, status: TaskStatus, message: str) -> None:
         task.status = status
         task.message = message
+        task.disk_low = False
         self._publish_task(task)
 
     def _finish(self, task: Task, status: TaskStatus, message: str) -> None:
         task.status = status
         task.message = message
+        task.disk_low = False
         task.terminal_at = time.time()
         self._publish_task(task)
         self._runners.pop(task.id, None)
@@ -783,6 +867,7 @@ class TaskEngine:
                 "status": task.status.value,
                 "message": task.message,
                 "session": task.session,
+                "disk_low": task.disk_low,
             }
         )
 
@@ -805,6 +890,14 @@ def _under_any(path: str, dir_paths: set[str]) -> bool:
     return any(path.startswith(d + "/") for d in dir_paths)
 
 
+def _fmt_bytes(n: int) -> str:
+    """磁盘提示用的人类可读大小"""
+    n = max(0, int(n or 0))
+    if n >= 1024 ** 3:
+        return f"{n / 1024 ** 3:.1f} GB"
+    return f"{n / 1024 ** 2:.0f} MB"
+
+
 def _history_expired(raw: dict, now: float | None = None) -> bool:
     """tasks.json 历史条目是否已超保留期：优先按终态时刻，老数据回退 created_at"""
     if str(raw.get("status") or "") not in {s.value for s in _TERMINAL}:
@@ -824,6 +917,7 @@ def _task_to_dict(task: Task) -> dict:
         "passcode": task.passcode,
         "session": task.session,
         "terminal_at": task.terminal_at,
+        "disk_low": task.disk_low,
         "items": [
             {
                 "id": s.id,
@@ -867,4 +961,5 @@ def _task_from_dict(raw: dict) -> Task:
         passcode=str(raw.get("passcode") or ""),
         session=str(raw.get("session") or ""),
         terminal_at=float(raw["terminal_at"]) if raw.get("terminal_at") else None,
+        disk_low=bool(raw.get("disk_low")),
     )

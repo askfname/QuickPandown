@@ -24,6 +24,8 @@ class SettingsPayload(BaseModel):
     # 保留期分钟数
     retention_minutes: int | None = Field(default=None, ge=1, le=365 * 24 * 60)
     max_download_mb: int | None = Field(default=None, ge=0, le=1024 * 1024)
+    # 磁盘预留空间（MB）：0=关闭守门
+    reserve_disk_mb: int | None = Field(default=None, ge=0, le=1024 * 1024)
 
 
 def _settings_view(s: Any) -> dict:
@@ -32,6 +34,7 @@ def _settings_view(s: Any) -> dict:
         "concurrency": s.concurrency,
         "retention_minutes": s.retention_minutes,
         "max_download_mb": s.max_download_mb,
+        "reserve_disk_mb": s.reserve_disk_mb,
     }
 
 
@@ -64,6 +67,8 @@ async def update_settings(payload: SettingsPayload, request: Request) -> dict:
         settings.retention_minutes = payload.retention_minutes
     if payload.max_download_mb is not None:
         settings.max_download_mb = payload.max_download_mb
+    if payload.reserve_disk_mb is not None:
+        settings.reserve_disk_mb = payload.reserve_disk_mb
     save_settings(settings)
 
     engine = getattr(request.app.state, "engine", None)
@@ -72,10 +77,15 @@ async def update_settings(payload: SettingsPayload, request: Request) -> dict:
         engine.settings.concurrency = settings.concurrency
         engine.settings.retention_minutes = settings.retention_minutes
         engine.settings.max_download_mb = settings.max_download_mb
+        engine.settings.reserve_disk_mb = settings.reserve_disk_mb
         # 保留期改动即时生效：重启清扫循环（0=停掉，>0=按新值换算间隔）
         restart = getattr(engine, "on_settings_changed", None)
         if restart is not None:
             restart()
+        # 预留空间/下载目录变化：立即重评排队任务
+        wake = getattr(engine, "notify_disk_changed", None)
+        if wake is not None:
+            await wake()
     return _settings_view(settings)
 
 

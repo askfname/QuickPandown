@@ -19,7 +19,7 @@ from app.auth_middleware import AuthMiddleware
 from app.config import load_settings
 from app.db import get_db_url, init_db, session_maker
 from app.engine.events import EventBus
-from app.engine.tasks import TaskEngine, TaskStatus
+from app.engine.tasks import DISK_MONITOR_INTERVAL_SECONDS, TaskEngine, TaskStatus
 from app.quark.client import QuarkApiError, QuarkClient
 from app.quark.errors import friendly_message
 from app.share_session import share_session
@@ -96,6 +96,19 @@ async def _lifespan(app: FastAPI):
     engine.on_settings_changed = _start_sweeper  # 设置保存时换挡（间隔/开关）
     _start_sweeper()
 
+    # 磁盘监控：周期唤醒排队任务重评空间；设置保存后另有即时唤醒
+    async def disk_monitor_loop() -> None:
+        while True:
+            try:
+                wake = getattr(engine, "notify_disk_changed", None)
+                if wake is not None:
+                    await wake()
+            except Exception:  # noqa: BLE001 - 监控失败不阻断应用
+                pass
+            await asyncio.sleep(DISK_MONITOR_INTERVAL_SECONDS)
+
+    disk_task = asyncio.create_task(disk_monitor_loop())
+
     queue = app.state.bus.subscribe()
 
     async def persist_loop() -> None:
@@ -119,6 +132,9 @@ async def _lifespan(app: FastAPI):
             sweep_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await sweep_task
+        disk_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await disk_task
         app.state.bus.unsubscribe(queue)
         if app.state.db_engine is not None:
             # 连接池收尾：不 dispose 会在进程退出时留下 aiomysql
