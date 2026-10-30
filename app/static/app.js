@@ -12,6 +12,7 @@ const store = {
   cookie: localStorage.getItem("qp_cookie") || "",
   // fid -> {fid, name, dir, size, loaded, children, expanded, checked}
   roots: [],
+  statsPending: new Set(), // 未展开目录子树统计请求去重（fid 集合）
   filters: { type: "", minSizeMB: null },
   tasks: {}, // task_id -> 最新任务对象
   autoDone: new Set(), // 已自动触发过下载的任务（防 SSE 重复触发）
@@ -128,6 +129,26 @@ async function postJSON(path, payload, opts) {
 const AUTH = { auth: true };
 
 /* ---------- 解析 ---------- */
+// 提取码统一识别：链接内 ?pwd= 优先；其次「提取码: XXX / 密码：XXX」文本形态
+// 后端契约只认链接内的 ?pwd=/?passcode=，文本式的必须由前端拼好再发
+function passcodeFromRaw(raw) {
+  const viaQuery = raw.match(/[?&](?:pwd|passcode)=([A-Za-z0-9]{1,16})/);
+  if (viaQuery) return viaQuery[1];
+  const viaText = raw.match(/(?:提取码|密码)\s*[:：]?\s*([A-Za-z0-9]{1,16})/);
+  return viaText ? viaText[1] : "";
+}
+
+function urlWithPasscode(raw) {
+  // 已有 ?pwd/?passcode 原样透传；文本式提取码拼接到第一条分享链接
+  if (/[?&](?:pwd|passcode)=/.test(raw)) return raw;
+  const passcode = passcodeFromRaw(raw);
+  if (!passcode) return raw;
+  return raw.replace(
+    /(pan\.quark\.cn\/s\/[a-f0-9]{8,})(\?\S*)?/,
+    `$1?pwd=${encodeURIComponent(passcode)}`
+  );
+}
+
 async function parse() {
   const raw = $("url-input").value.trim();
   const msg = $("parse-message");
@@ -139,7 +160,7 @@ async function parse() {
   $("parse-btn").disabled = true;
   msg.textContent = "解析中…";
   try {
-    const body = await postJSON("/api/parse", { url: raw }, AUTH);
+    const body = await postJSON("/api/parse", { url: urlWithPasscode(raw) }, AUTH);
     handleParseResult(body);
   } catch (err) {
     msg.textContent = `解析失败：${err.message}`;
@@ -159,9 +180,11 @@ function handleParseResult(body) {
   $("passcode-row").classList.add("hidden");
   msg.textContent = "";
   store.shareId = body.share_id;
-  // 链接本身带提取码时后端不回显，这里从原文补齐，否则后续下载会报需要提取码
-  store.passcode = (store.rawInput.match(/[?&](?:pwd|passcode)=([A-Za-z0-9]{1,16})/) || [])[1] || "";
+  // 提取码补齐：兼容链接 ?pwd= 与文本式「提取码: XXX」两种来源，
+  // 缺它会导致后续 /api/list 与 /api/download 全部再报"需要提取码"
+  store.passcode = passcodeFromRaw(store.rawInput);
   store.title = body.title || "";
+  store.statsPending.clear(); // 新分享的子树统计请求与旧树无关，清空在途去重
   store.roots = body.files.map(makeNode);
   $("share-title").textContent = store.title ? `📦 ${store.title}` : "";
   renderTree();
@@ -216,6 +239,8 @@ function makeNode(f) {
     expanded: false,
     checked: false,
     loading: false,
+    // 未展开目录的子树统计 {count, bytes}（/api/tree-size 异步回填；null=未就绪）
+    stats: null,
   };
 }
 
@@ -352,16 +377,19 @@ function renderTree() {
 
 /* ---------- 选择与筛选 ---------- */
 function selectAll() {
+  // 全选覆盖目录节点：未展开的文件夹也勾选（懒加载后新叶子经继承逻辑自动勾上），
+  // 整目录分享才能「一键全选」直接可提交
   walkNodes((n) => {
-    if (!n.dir && nodeMatchesFilter(n)) n.checked = true;
+    if (nodeMatchesFilter(n)) n.checked = true;
   });
   renderTree();
   updateSelectedBar();
 }
 
 function invertSelection() {
+  // 反选同样作用于目录节点（已加载叶子按各自状态翻转；目录翻转经 cascade 传播）
   walkNodes((n) => {
-    if (!n.dir && nodeMatchesFilter(n)) n.checked = !n.checked;
+    if (nodeMatchesFilter(n)) n.checked = !n.checked;
   });
   renderTree();
   updateSelectedBar();
@@ -377,13 +405,58 @@ function applyFilters() {
 }
 
 function updateSelectedBar() {
-  // 与 collectDownloadItems 同一权威模型：整目录提交的计 1 项（目录 size 恒为 0，不展示体积），
-  // 其余按勾选叶子文件的个数与体积计
-  const nodes = store.roots.flatMap(selectionFor);
-  $("selected-count").textContent = String(nodes.length);
-  $("selected-size").textContent = fmtSize(
-    nodes.reduce((sum, n) => sum + (n.dir ? 0 : n.size || 0), 0)
-  );
+  // 与 collectDownloadItems 同一权威模型；展示层把目录项展开成已加载叶子计数与大小
+  // 未展开目录没有本地叶子数据：优先用后端子树统计 node.stats，未就绪期间
+  // 后台调度 /api/tree-size，回填后刷新本条。提交 payload 不变（selectionFor 决定）
+  let count = 0;
+  let size = 0;
+  for (const node of store.roots.flatMap(selectionFor)) {
+    if (node.dir) {
+      const leaves = loadedLeafCount(node);
+      if (leaves) {
+        count += leaves;
+        size += loadedLeafSize(node);
+      } else if (node.stats) {
+        count += node.stats.count;
+        size += node.stats.bytes;
+      } else {
+        count += 1; // 统计未就绪：先按目录本身计 1 项
+        scheduleTreeStats(node);
+      }
+    } else {
+      count += 1;
+      size += node.size || 0;
+    }
+  }
+  $("selected-count").textContent = String(count);
+  $("selected-size").textContent = fmtSize(size);
+}
+
+/* ---------- 未展开目录子树统计 ---------- */
+// 勾选未展开目录时前后端都还不知道里面有多少文件/多大：调 /api/tree-size 让
+// 后端遍历子树统计叶子数与字节合计，异步回填 node.stats 并刷新选择条
+function scheduleTreeStats(node) {
+  if (!node || !node.dir || node.stats || !store.shareId) return;
+  if (store.statsPending.has(node.fid)) return; // 同一目录只发一次
+  store.statsPending.add(node.fid);
+  const release = () => store.statsPending.delete(node.fid);
+  postJSON("/api/tree-size", {
+    share_id: store.shareId,
+    fid: node.fid,
+    passcode: store.passcode,
+  }, AUTH)
+    .then((body) => {
+      if (!body.need_passcode) {
+        node.stats = { count: body.count || 0, bytes: body.bytes || 0 };
+      }
+    })
+    .catch(() => {
+      // 静默失败：选择条维持「1 项 / 0.0 B」回退口径，不阻断主流程
+    })
+    .finally(() => {
+      release();
+      updateSelectedBar(); // 回填（或清 pending）后重算，让其它未就绪目录排队
+    });
 }
 
 /* ---------- 下载 ---------- */
@@ -423,7 +496,8 @@ function collectDownloadItems() {
   return store.roots.flatMap(selectionFor).map((n) => ({ fid: n.fid, isDir: n.dir }));
 }
 
-// 勾选项大小表：文件按自身 size，目录按已加载叶子累计（服务器转存前预检用）
+// 勾选项大小表：文件按自身 size，目录按已加载叶子累计；未加载目录回退
+// 后端子树统计 stats.bytes（勾选未展开文件夹时预检也能有真实体积）
 function collectSizeMaps(items) {
   const byFid = new Map();
   const walkAll = (n) => {
@@ -436,8 +510,12 @@ function collectSizeMaps(items) {
   for (const it of items) {
     const node = byFid.get(it.fid);
     if (!node) continue;
-    if (it.isDir) dirSizes[it.fid] = loadedLeafSize(node);
-    else sizes[it.fid] = node.size || 0;
+    if (it.isDir) {
+      const loaded = loadedLeafSize(node);
+      dirSizes[it.fid] = loaded || (node.stats ? node.stats.bytes : 0);
+    } else {
+      sizes[it.fid] = node.size || 0;
+    }
   }
   return { sizes, dirSizes };
 }

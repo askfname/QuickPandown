@@ -35,6 +35,12 @@ class ListRequest(BaseModel):
     passcode: str = ""
 
 
+class TreeSizeRequest(BaseModel):
+    share_id: str
+    fid: str
+    passcode: str = ""
+
+
 class PasscodeResponse(BaseModel):
     need_passcode: bool = True
     message: str
@@ -116,3 +122,22 @@ async def list_files(payload: ListRequest, request: Request) -> dict:
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=400, detail=_NETWORK_ERROR_MESSAGE) from exc
     return {"files": files}
+
+
+@router.post("/tree-size")
+async def tree_size(payload: TreeSizeRequest, request: Request) -> dict:
+    """未展开目录的子树统计：勾选未展开文件夹时显示真实文件数量与大小"""
+    try:
+        count, size = await share_session.subtree_stats(
+            payload.share_id, payload.fid, payload.passcode, client=_user_client(request)
+        )
+    except QuarkApiError as exc:
+        if exc.code in (31001, 41008):
+            return PasscodeResponse(
+                need_passcode=True,
+                message=friendly_message(exc.code, exc.message or "分享需要提取码"),
+            ).model_dump()
+        raise
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=400, detail=_NETWORK_ERROR_MESSAGE) from exc
+    return {"count": count, "bytes": size}

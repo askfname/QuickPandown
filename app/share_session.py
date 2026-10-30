@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.quark.client import QuarkApiError, QuarkClient
-from app.quark.share import API_TOKEN, list_dir
+from app.quark.share import API_TOKEN, list_dir, walk_subtree
 
 TTL_SECONDS = 30 * 60
 # 缓存条目上限：链接数可能很多（每人每次解析都入缓存），有界防内存慢涨
@@ -29,10 +29,14 @@ class ShareSession:
     """内存会话缓存；resolve 失败不写缓存，过期后自动重取，超量丢最旧"""
 
     MAX_ENTRIES = 256
+    # 子树统计缓存条目上限（key 为 (share_id, fid)，量级与目录数同阶）
+    MAX_TREE_ENTRIES = 256
 
     def __init__(self, client: Any = None) -> None:
         self._client = client
         self._cache: dict[tuple[str, str], tuple[SessionEntry, float]] = {}
+        # (share_id, fid) → (叶子数, 字节合计, 过期时刻)；供未展开目录的选择条统计
+        self._tree_cache: dict[tuple[str, str], tuple[int, int, float]] = {}
 
     def _evict_if_needed(self) -> None:
         """超量时先清过期，仍超则丢最旧（FIFO）"""
@@ -45,12 +49,24 @@ class ShareSession:
             oldest = next(iter(self._cache))
             del self._cache[oldest]
 
+    def _evict_tree_cache_if_needed(self) -> None:
+        """子树统计缓存：与 resolve 缓存同一淘汰策略（先清过期，再丢最旧）"""
+        if len(self._tree_cache) <= self.MAX_TREE_ENTRIES:
+            return
+        now = _now()
+        for key in [k for k, (_, _, exp) in self._tree_cache.items() if exp < now]:
+            del self._tree_cache[key]
+        while len(self._tree_cache) > self.MAX_TREE_ENTRIES:
+            oldest = next(iter(self._tree_cache))
+            del self._tree_cache[oldest]
+
     def set_client(self, client: Any) -> None:
         self._client = client
 
     def clear(self) -> None:
         """清空全部缓存条目（测试隔离或强制重取时使用）"""
         self._cache.clear()
+        self._tree_cache.clear()
 
     def _ensure_client(self) -> Any:
         if self._client is None:
@@ -99,6 +115,31 @@ class ShareSession:
         entry = await self.resolve(share_id, passcode, client=client)
         use_client = client if client is not None else self._ensure_client()
         return await list_dir(use_client, share_id, entry.stoken, fid)
+
+    async def subtree_stats(
+        self, share_id: str, fid: str, passcode: str = "", *, client: Any = None
+    ) -> tuple[int, int]:
+        """统计某目录子树的叶子数与字节合计（供未展开目录的选择条展示）。
+
+        树内容在会话期内基本不变，按 (share_id, fid) 缓存 TTL_SECONDS；
+        resolve 仍复用会话缓存（token 只换一次）
+        """
+        key = (share_id, fid)
+        cached = self._tree_cache.get(key)
+        if cached is not None:
+            count, size, expires_at = cached
+            if _now() < expires_at:
+                return count, size
+            del self._tree_cache[key]
+
+        entry = await self.resolve(share_id, passcode, client=client)
+        use_client = client if client is not None else self._ensure_client()
+        entries = await walk_subtree(use_client, share_id, entry.stoken, fid)
+        count = sum(1 for e in entries if not e.get("dir"))
+        size = sum(e.get("size") or 0 for e in entries if not e.get("dir"))
+        self._tree_cache[key] = (count, size, _now() + TTL_SECONDS)
+        self._evict_tree_cache_if_needed()
+        return count, size
 
 
 # 模块级单例：供路由与后续任务（Task 8）复用
