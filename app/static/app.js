@@ -833,11 +833,15 @@ function renderTaskCard(t) {
   if (RUNNING_STATUSES.has(t.status)) {
     const cancelBtn = document.createElement("button");
     cancelBtn.textContent = "取消";
+    // SSE 进度会频繁重建任务卡：渲染时从在途守卫恢复禁用态，
+    // 否则请求期间的重复渲染会带出可点的全新按钮，连点因此重复提交
+    cancelBtn.disabled = store.taskBusy.has(t.id + ":cancel");
     cancelBtn.addEventListener("click", () => taskAction(cancelBtn, t.id, "cancel"));
     actions.appendChild(cancelBtn);
   } else if (t.status === "failed") {
     const retryBtn = document.createElement("button");
     retryBtn.textContent = "重试";
+    retryBtn.disabled = store.taskBusy.has(t.id + ":retry");
     retryBtn.addEventListener("click", () => taskAction(retryBtn, t.id, "retry"));
     actions.appendChild(retryBtn);
   }

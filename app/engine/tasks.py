@@ -117,12 +117,16 @@ class TaskEngine:
         self._leaves: dict[str, list[tuple[str, dict]]] = {}
         # task_id -> sub_id -> 转存后拿到的直链
         self._links: dict[str, dict[str, LinkItem]] = {}
-        # task_id -> 用户 Cookie（仅内存；任务终态即清，绝不进持久化）
+        # task_id -> 用户 Cookie（仅内存；任务终态即清，避免进持久化）
         # failed 任务保留 Cookie 供 retry 使用，任务离开内存（persist 后从 _tasks
         # 移除不在本期实现，见 plan）时随进程结束清空
         self._cookies: dict[str, str] = {}
         # (task_id, sub_id) -> 上次进度事件 time.monotonic()：SSE 进度节流
         self._progress_ts: dict[tuple[str, str], float] = {}
+        # 任务级全局并发闸：同时在跑（转存/下载/清理）的任务数受「并发数」限制，
+        # 超出的任务留在 queued 态排队等候。Condition 自带独立锁，wait 期间自动放行
+        self._gate: asyncio.Condition = asyncio.Condition()
+        self._active_downloads = 0
 
     # ---- 创建 / 查询 -------------------------------------------------------
 
@@ -284,43 +288,69 @@ class TaskEngine:
     # ---- 运行 / 取消 / 重试 ------------------------------------------------
 
     async def run(self, task_id: str) -> None:
-        """单任务主流程：transferring → downloading → cleaning → done/failed/cancelled"""
+        """单任务主流程：queued 排队 → transferring → downloading → cleaning → 终态
+
+        开跑前先过任务级全局并发闸：超过设置的并发数时在 queued 态排队等候，避免超发网盘请求
+        """
         task = self._tasks.get(task_id)
         if task is None or task.status is not TaskStatus.queued:
             return
 
         flag = self._cancel_flags[task_id]
+        acquired = False
         try:
-            if flag.is_set():
-                raise asyncio.CancelledError()
-            await self._transfer(task, flag)
-            if flag.is_set():
-                raise asyncio.CancelledError()
+            try:
+                async with self._gate:
+                    while (not flag.is_set()
+                           and self._active_downloads >= max(1, self.settings.concurrency)):
+                        task.message = "正在排队等候（下载并发已满）…"
+                        self._publish_task(task)
+                        await self._gate.wait()
+                    if flag.is_set():
+                        raise asyncio.CancelledError()
+                    self._active_downloads += 1
+                    acquired = True
 
-            self._set_status(task, TaskStatus.downloading, "")
-            await self._download_all(task, flag)
+                if flag.is_set():
+                    raise asyncio.CancelledError()
+                await self._transfer(task, flag)
+                if flag.is_set():
+                    raise asyncio.CancelledError()
 
-            failed = [s for s in task.items if s.status == "failed"]
-            if failed:
-                await self._cleanup(task)
-                self._finish(
-                    task,
-                    TaskStatus.failed,
-                    f"{len(failed)} 个文件下载失败：{failed[0].error or ''}",
-                )
-                return
+                self._set_status(task, TaskStatus.downloading, "")
+                await self._download_all(task, flag)
 
-            self._set_status(task, TaskStatus.cleaning, "正在清理云端临时文件…")
-            cleanup_ok = await self._cleanup(task)
-            if cleanup_ok:
-                self._finish(task, TaskStatus.done, "")
-            else:
-                self._finish(
-                    task,
-                    TaskStatus.done,
-                    "下载完成，但云端临时文件删除失败，请手动删除网盘 QuickPandownTemp 目录中的文件",
-                )
+                failed = [s for s in task.items if s.status == "failed"]
+                if failed:
+                    await self._cleanup(task)
+                    self._finish(
+                        task,
+                        TaskStatus.failed,
+                        f"{len(failed)} 个文件下载失败：{failed[0].error or ''}",
+                    )
+                    return
+
+                self._set_status(task, TaskStatus.cleaning, "正在清理云端临时文件…")
+                cleanup_ok = await self._cleanup(task)
+                if cleanup_ok:
+                    self._finish(task, TaskStatus.done, "")
+                else:
+                    self._finish(
+                        task,
+                        TaskStatus.done,
+                        "下载完成，但云端临时文件删除失败，请手动删除网盘 QuickPandownTemp 目录中的文件",
+                    )
+            finally:
+                if acquired:
+                    # 释放槽位并叫醒排队中的 runner 重新抢（持锁期间改计数，无竞态）
+                    async with self._gate:
+                        self._active_downloads -= 1
+                        self._gate.notify_all()
         except asyncio.CancelledError:
+            if not acquired and (task.status in _TERMINAL or flag.is_set()):
+                # 等待闸位期被取消：cancel() 的排队分支负责收尾，不重复清理；
+                # 已获槽位的取消仍走下面统一收尾（waiting/download 子项清状态）
+                return
             for sub in task.items:
                 if sub.status in ("waiting", "downloading"):
                     sub.status = "cancelled"
@@ -351,6 +381,10 @@ class TaskEngine:
         flag = self._cancel_flags.get(task_id)
         if flag is not None:
             flag.set()
+            # 立即叫醒卡在并发闸上的 runner：让它复查取消标志退出，
+            # 别一直挂到下一轮槽位释放才醒
+            async with self._gate:
+                self._gate.notify_all()
 
         # 排队任务（runner 尚未跑过任何转存）：直接标 cancelled 并清理，
         # run() 开头的标志检查会让迟到的 runner 立即返回
@@ -637,7 +671,7 @@ class TaskEngine:
 
         已 done 的子项文件保留（用户可能已经用它的下载链接交付了）；随后从
         各删除点深→浅收拢空目录（任务目录、已空出的用户名目录一并移除）——
-        rmdir 仅对空目录成功，非空即停（保护其他任务的文件），绝不越过
+        rmdir 仅对空目录成功，非空即停（保护其他任务的文件），避免越过
         下载根。cloud 临时由 _cleanup 负责，这里只管磁盘
         """
         base = self._download_base()
@@ -663,7 +697,7 @@ class TaskEngine:
     async def _cleanup(self, task: Task) -> bool:
         """删除已转存未清理的云端临时文件；失败仅记日志，返回是否全部删除成功。
 
-        skip_cleanup 的直链（自己的分享直连原文件）绝不删除
+        skip_cleanup 的直链（自己的分享直连原文件）不删除
         """
         links = self._links.get(task.id) or {}
         fids = [link.fid for link in links.values() if link.fid and not link.skip_cleanup]
