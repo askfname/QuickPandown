@@ -116,6 +116,17 @@ main { max-width: 960px; margin: 16px auto; padding: 0 16px; display: flex; flex
   z-index: 5;
 }
 
+/* 子树统计在途占位:数字位显示跳动的「…」(勾选含未展开的深目录时反馈等待状态) */
+.stats-dots {
+  display: inline-block;
+  animation: stats-dots 1s ease-in-out infinite;
+}
+
+@keyframes stats-dots {
+  0%, 100% { transform: translateY(0); opacity: 0.4; }
+  50%, 60% { transform: translateY(-2px); opacity: 1; }
+}
+
 /* 任务 */
 .tasks { display: flex; flex-direction: column; gap: 10px; }
 .task-card { border: 1px solid var(--border); border-radius: var(--radius); padding: 10px; }

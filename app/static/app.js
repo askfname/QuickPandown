@@ -405,23 +405,34 @@ function applyFilters() {
 }
 
 function updateSelectedBar() {
-  // 与 collectDownloadItems 同一权威模型；展示层把目录项展开成已加载叶子计数与大小
-  // 未展开目录没有本地叶子数据：优先用后端子树统计 node.stats，未就绪期间
-  // 后台调度 /api/tree-size，回填后刷新本条。提交 payload 不变（selectionFor 决定）
+  // 与 collectDownloadItems 同一权威模型。整目录输出按准确性排序口径：
+  // 1) node.stats（/api/tree-size 全子树统计，含未展开的子文件夹）= 精确值，优先；
+  // 2) 本地已加载叶子 = 统计在途或不可用时的部分值兜底；
+  // 3) 两者都没有 = 目录暂计 1 项并显示加载动画，后台请求见 scheduleTreeStats
   let count = 0;
   let size = 0;
+  let waiting = false;
   for (const node of store.roots.flatMap(selectionFor)) {
     if (node.dir) {
-      const leaves = loadedLeafCount(node);
-      if (leaves) {
-        count += leaves;
-        size += loadedLeafSize(node);
-      } else if (node.stats) {
+      if (node.stats) {
         count += node.stats.count;
         size += node.stats.bytes;
       } else {
-        count += 1; // 统计未就绪：先按目录本身计 1 项
-        scheduleTreeStats(node);
+        const leaves = loadedLeafCount(node);
+        if (leaves) {
+          count += leaves;
+          size += loadedLeafSize(node);
+          // 已加载部分叶子但树下还有未展开的孙子目录：叶子累计只是部分值，
+          // 后台补一次子树统计，回填后即切成精确口径
+          if (hasUnloadedDirDescendant(node)) {
+            waiting = true;
+            scheduleTreeStats(node);
+          }
+        } else {
+          count += 1; // 统计在途：目录本身暂计 1 项
+          waiting = true;
+          scheduleTreeStats(node);
+        }
       }
     } else {
       count += 1;
@@ -430,6 +441,16 @@ function updateSelectedBar() {
   }
   $("selected-count").textContent = String(count);
   $("selected-size").textContent = fmtSize(size);
+  // 统计在途:数字位换跳动的「…」占位,回填后即显示真实值
+  if (waiting) {
+    $("selected-count").innerHTML = '<span class="stats-dots">…</span>';
+    $("selected-size").innerHTML = '<span class="stats-dots">…</span> B';
+  }
+}
+
+// 子树下是否存在未加载的目录（用于判断已加载叶子累计是否完整）
+function hasUnloadedDirDescendant(node) {
+  return node.children.some((c) => !c.loaded || (c.dir && hasUnloadedDirDescendant(c)));
 }
 
 /* ---------- 未展开目录子树统计 ---------- */
@@ -464,12 +485,13 @@ function scheduleTreeStats(node) {
 // 否则只提交其中勾选的叶子文件；未展开的已勾选目录按整目录提交（内容未知）
 function selectionFor(node) {
   if (!node.dir || !node.loaded) return node.checked ? [node] : [];
-  const childSel = node.children.flatMap(selectionFor);
-  // 按叶子覆盖率判断：全部已加载叶子都被勾选（含整目录子项覆盖的）才整目录提交
-  const leaves = loadedLeafCount(node);
-  const covered = childSel.reduce((s, n) => s + (n.dir ? loadedLeafCount(n) : 1), 0);
-  if (leaves > 0 && covered === leaves) return [node];
-  return childSel;
+  const outs = node.children.map((c) => ({ child: c, sel: selectionFor(c) }));
+  // 空目录按自身勾选表态（没有可覆盖的叶子，塌缩判定不适用）
+  if (outs.length === 0) return node.checked ? [node] : [];
+  // 已加载目录：仅当每个直接子项的输出都是「整目录」（[child] / 文件本身）才塌缩为
+  // [node]——归纳保证整棵子树全被勾选覆盖
+  if (outs.every((o) => o.sel.length === 1 && o.sel[0] === o.child)) return [node];
+  return outs.flatMap((o) => o.sel);
 }
 
 function loadedLeafCount(node) {
@@ -511,8 +533,8 @@ function collectSizeMaps(items) {
     const node = byFid.get(it.fid);
     if (!node) continue;
     if (it.isDir) {
-      const loaded = loadedLeafSize(node);
-      dirSizes[it.fid] = loaded || (node.stats ? node.stats.bytes : 0);
+      // 后端子树统计优先：含未展开子文件夹的精确体积；无统计才退回已加载叶子累计
+      dirSizes[it.fid] = node.stats ? node.stats.bytes : loadedLeafSize(node);
     } else {
       sizes[it.fid] = node.size || 0;
     }
