@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>快客盘 QuickPandown</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-<link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/style.css?v=20261101c">
 </head>
 <body>
 <header class="topbar">
@@ -19,14 +19,58 @@
   </div>
 </header>
 
+<!-- 普通用户专属：赞助入口；管理员由 JS 移除 -->
+<div id="sponsor-bar" class="sponsor-bar hidden" role="region" aria-label="赞助支持">
+  <span class="sponsor-bar-text">喜欢 QuickPandown？欢迎支持作者持续维护</span>
+  <div class="sponsor-links">
+    <a class="sponsor-link afdian" href="https://afdian.com/a/playlab"
+       target="_blank" rel="noopener noreferrer" title="在爱发电赞助 QuickPandown">
+      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <path fill="currentColor" d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/>
+      </svg>
+      <span>爱发电</span>
+    </a>
+    <a class="sponsor-link kofi" href="https://ko-fi.com/playlaboratory"
+       target="_blank" rel="noopener noreferrer" title="在 Ko-fi 赞助 QuickPandown">
+      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <path fill="currentColor" d="M5 4h12v2h1.5A3.5 3.5 0 0 1 22 9.5 3.5 3.5 0 0 1 18.5 13H18v1.5A3.5 3.5 0 0 1 14.5 18h-6A3.5 3.5 0 0 1 5 14.5V4zm13 4v3h.5a1.5 1.5 0 0 0 0-3H18z"/>
+        <path fill="currentColor" d="M8 1h2v2H8zM12 1h2v2h-2z"/>
+      </svg>
+      <span>Ko-fi</span>
+    </a>
+  </div>
+</div>
+
 <main>
-  <!-- 管理员专属：仅承载在线统计；邀请码管理在顶部按钮的弹窗里。普通用户由 JS 移除 -->
+  <!-- 管理员专属：在线/流量统计 + 磁盘用量条；邀请码管理在顶部按钮的弹窗里。普通用户由 JS 移除 -->
   <section id="admin-panel" class="panel admin-panel hidden">
     <div class="admin-stats">
       <div class="stat-box"><span class="stat-num" id="stat-online">-</span><span class="stat-label">在线用户</span></div>
       <div class="stat-box"><span class="stat-num" id="stat-downloading">-</span><span class="stat-label">正在下载</span></div>
-      <div class="stat-box"><span class="stat-num" id="stat-disk-used">-</span><span class="stat-label">磁盘已用</span></div>
-      <div class="stat-box" id="disk-free-box"><span class="stat-num" id="stat-disk-free">-</span><span class="stat-label">磁盘剩余</span></div>
+      <div class="stat-box traffic-box traffic-up" title="服务器向浏览器交付文件产生的出站流量">
+        <span class="stat-num" id="stat-upload">-</span>
+        <span class="stat-label">↑ 上传流量</span>
+      </div>
+      <div class="stat-box traffic-box traffic-down" title="服务器从夸克下载文件产生的入站流量">
+        <span class="stat-num" id="stat-download">-</span>
+        <span class="stat-label">↓ 下载流量</span>
+      </div>
+    </div>
+    <div id="disk-usage" class="disk-usage">
+      <div class="disk-usage-head">
+        <span class="disk-usage-title">磁盘用量</span>
+        <span id="disk-summary" class="disk-usage-summary">-</span>
+      </div>
+      <div id="disk-bar" class="disk-bar" role="img" aria-label="磁盘空间使用情况">
+        <span id="disk-seg-used" class="disk-seg used"></span>
+        <span id="disk-seg-free" class="disk-seg free"></span>
+        <span id="disk-seg-reserve" class="disk-seg reserve"></span>
+      </div>
+      <div class="disk-legend">
+        <span class="disk-legend-item" title="已被其他文件占用的空间"><i class="disk-dot used"></i>已用 <b id="stat-disk-used">-</b></span>
+        <span class="disk-legend-item" title="扣除预留后可分配给下载的空间"><i class="disk-dot free"></i>剩余 <b id="stat-disk-free">-</b></span>
+        <span class="disk-legend-item" title="为系统与磁盘波动保留的空间"><i class="disk-dot reserve"></i>预留 <b id="stat-disk-reserve">-</b></span>
+      </div>
     </div>
     <div id="disk-hint" class="disk-alert hidden" role="alert">
       <span id="disk-hint-text">⚠ 可用空间低于预留值，新下载将排队等待</span>
@@ -109,17 +153,66 @@
 </div>
 
 <div id="invites-modal" class="modal hidden">
-  <div class="modal-box">
+  <div class="modal-box invites-box">
     <div class="modal-head">
-      <h3>邀请码管理</h3>
+      <div>
+        <h3>邀请码管理</h3>
+        <p class="modal-tip modal-head-tip">维护注册准入规则、注册页提示与邀请码</p>
+      </div>
       <button class="modal-close" title="关闭">✕</button>
     </div>
-    <p class="modal-tip">邀请码仅限注册新用户使用一次；已使用的邀请码不可删除。</p>
-    <div class="invite-add-row">
-      <textarea id="invite-input" rows="2" placeholder="输入邀请码，每行一个（支持批量）"></textarea>
-      <button id="invite-add" class="primary">批量添加</button>
+    <div class="invite-manage-grid">
+      <section class="invite-panel">
+        <h4 class="invite-panel-title">注册设置</h4>
+        <label class="invite-switch">
+          <span class="invite-switch-text">
+            <b>启用邀请码注册</b>
+            <small>关闭后任何人都可以直接注册</small>
+          </span>
+          <input id="invite-required" type="checkbox">
+        </label>
+        <label class="invite-switch">
+          <span class="invite-switch-text">
+            <b>显示提示内容和联系方式</b>
+            <small>仅在启用邀请码注册时展示</small>
+          </span>
+          <input id="invite-show-tip" type="checkbox">
+        </label>
+        <label class="setting-field" for="invite-tip-input">
+          <span>提示内容</span>
+          <textarea id="invite-tip-input" rows="3" maxlength="500"
+            placeholder="由于服务器资源有限，目前仅限邀请用户注册。你可以通过以下方式免费获取邀请码："></textarea>
+        </label>
+        <div class="invite-editor-head">
+          <span>联系方式</span>
+          <button id="invite-contact-add" class="link-btn" type="button">+ 添加</button>
+        </div>
+        <div id="invite-contact-list" class="invite-contact-list"></div>
+        <p class="setting-tip">默认已预填 Telegram、QQ 群；邮箱类型填写邮箱地址，点击后直接发信；其他类型填写 http(s) 链接，最多 3 条。</p>
+        <div class="invite-settings-actions">
+          <button id="invite-settings-save" class="primary" type="button">保存注册设置</button>
+          <span id="invite-settings-message" class="hint"></span>
+        </div>
+      </section>
+      <section class="invite-panel invite-panel-codes">
+        <h4 class="invite-panel-title">邀请码</h4>
+        <p class="modal-tip invite-codes-tip">邀请码仅限注册新用户使用一次；已使用的邀请码不可删除。</p>
+        <div class="invite-generate-row">
+          <label for="invite-generate-count">自动生成</label>
+          <input id="invite-generate-count" type="number" min="1" max="200" step="1" value="1"
+            inputmode="numeric" aria-label="生成数量">
+          <span class="invite-generate-unit">个</span>
+          <button id="invite-generate" class="primary" type="button">生成并复制</button>
+        </div>
+        <p class="setting-tip invite-generate-tip">使用安全随机字符生成，生成后自动复制到剪贴板。</p>
+        <div class="invite-or"><span>或手动添加</span></div>
+        <div class="invite-add-row">
+          <textarea id="invite-input" rows="3" placeholder="输入邀请码，每行一个（支持批量）"></textarea>
+          <button id="invite-add" class="primary">批量添加</button>
+        </div>
+        <div id="invite-list" class="invite-list"></div>
+      </section>
     </div>
-    <div id="invite-list" class="invite-list"></div>
   </div>
 </div>
 
@@ -156,6 +249,20 @@
       <input id="setting-reserve-disk" type="number" min="0" step="256" placeholder="1024">
     </div>
     <p class="setting-tip">可用空间低于预留值时，新下载任务自动排队，直到空间释放。</p>
+    <div class="setting-row">
+      <label for="setting-traffic-period">流量重置周期</label>
+      <select id="setting-traffic-period">
+        <option value="week">1 星期</option>
+        <option value="month" selected>1 个月</option>
+        <option value="year">1 年</option>
+        <option value="never">不自动重置</option>
+      </select>
+    </div>
+    <p class="setting-tip traffic-range-tip">
+      <span id="traffic-range">统计周期：-</span>
+      <button id="traffic-quick-reset" class="link-btn" type="button" title="立即清零本期流量统计">重置</button>
+    </p>
+    <p class="setting-tip">只统计文件传输字节（不含页面与接口请求）；重置后从零开始累计。</p>
     <div class="modal-actions">
       <button id="settings-save" class="primary">保存</button>
       <span id="settings-message" class="hint"></span>
@@ -165,6 +272,6 @@
 
 <div id="toast"></div>
 
-<script src="/app.js"></script>
+<script src="/app.js?v=20261101c"></script>
 </body>
 </html>

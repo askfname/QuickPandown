@@ -27,12 +27,14 @@ async def download_file(
     on_progress: Callable[[int, int], None] | None = None,
     cancel_flag: asyncio.Event | None = None,
     backoff: Callable[[int], float] | None = None,
+    on_bytes: Callable[[int], None] | None = None,
 ) -> Path:
     """下载 item 到终文件全路径 dest（上层负责建目录）。
 
     写 ``dest.part``；已有 part 时以 ``Range: bytes=<len(part)>-`` 续传；
     整体最多 MAX_ATTEMPTS 次尝试，间隔 backoff(attempt)（默认 min(2^n,8)s）；
-    取消时抛 ``asyncio.CancelledError`` 并保留 part 供下次续传
+    取消时抛 ``asyncio.CancelledError`` 并保留 part 供下次续传。
+    ``on_bytes`` 按实际收到的响应体字节回调（流量统计用，含重试）
     """
     backoff = backoff or _default_backoff
     part = dest.with_name(dest.name + ".part")
@@ -42,7 +44,7 @@ async def download_file(
         _check_cancel(cancel_flag)
         try:
             return await _attempt(
-                http, item, cookie, dest, part, on_progress, cancel_flag
+                http, item, cookie, dest, part, on_progress, cancel_flag, on_bytes
             )
         except asyncio.CancelledError:
             raise
@@ -62,6 +64,7 @@ async def _attempt(
     part: Path,
     on_progress: Callable[[int, int], None] | None,
     cancel_flag: asyncio.Event | None,
+    on_bytes: Callable[[int], None] | None,
 ) -> Path:
     offset = part.stat().st_size if part.exists() else 0
     headers = {
@@ -95,6 +98,8 @@ async def _attempt(
                 _check_cancel(cancel_flag)
                 f.write(chunk)
                 written += len(chunk)
+                if on_bytes is not None:
+                    on_bytes(len(chunk))
                 _check_cancel(cancel_flag)
                 _report(on_progress, base + written, item.size)
         if expected is not None and written != expected:

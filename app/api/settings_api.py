@@ -2,18 +2,39 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
-from app.config import MAX_RETENTION_MINUTES, load_settings, save_settings
+from app.config import (
+    DEFAULT_TRAFFIC_RESET_PERIOD,
+    MAX_INVITE_CONTACTS,
+    MAX_RETENTION_MINUTES,
+    is_valid_contact_value,
+    load_settings,
+    save_settings,
+)
 from app.quark.account import check_cookie
 
 router = APIRouter(prefix="/api")
 
 INVALID_COOKIE_MESSAGE = "Cookie 无效，请重新复制"
+
+
+class InviteContact(BaseModel):
+    """邀请码联系方式：邮箱类型存邮箱地址，其余类型存 http(s) 链接"""
+
+    name: str = Field(min_length=1, max_length=32)
+    url: str = Field(min_length=1, max_length=500)
+    icon: Literal["telegram", "qq", "whatsapp", "discord", "email", "link"] = "link"
+
+    @model_validator(mode="after")
+    def _check_value(self) -> "InviteContact":
+        if not is_valid_contact_value(self.icon, self.url):
+            raise ValueError("邮箱类型需填写邮箱地址，其他类型需填写 http(s) 链接")
+        return self
 
 
 class SettingsPayload(BaseModel):
@@ -26,6 +47,15 @@ class SettingsPayload(BaseModel):
     max_download_mb: int | None = Field(default=None, ge=0, le=1024 * 1024)
     # 磁盘预留空间（MB）：0=关闭守门
     reserve_disk_mb: int | None = Field(default=None, ge=0, le=1024 * 1024)
+    # 流量统计重置周期；非法值由 pydantic 拒为 422
+    traffic_reset_period: Literal["week", "month", "year", "never"] | None = None
+    # 注册策略：邀请码开关、提示开关与自定义内容
+    invite_required: bool | None = None
+    invite_show_tip: bool | None = None
+    invite_tip_text: str | None = Field(default=None, max_length=500)
+    invite_contacts: list[InviteContact] | None = Field(
+        default=None, max_length=MAX_INVITE_CONTACTS
+    )
 
 
 def _settings_view(s: Any) -> dict:
@@ -35,6 +65,13 @@ def _settings_view(s: Any) -> dict:
         "retention_minutes": s.retention_minutes,
         "max_download_mb": s.max_download_mb,
         "reserve_disk_mb": s.reserve_disk_mb,
+        "traffic_reset_period": getattr(
+            s, "traffic_reset_period", DEFAULT_TRAFFIC_RESET_PERIOD
+        ),
+        "invite_required": s.invite_required,
+        "invite_show_tip": s.invite_show_tip,
+        "invite_tip_text": s.invite_tip_text,
+        "invite_contacts": [dict(c) for c in s.invite_contacts],
     }
 
 
@@ -69,6 +106,17 @@ async def update_settings(payload: SettingsPayload, request: Request) -> dict:
         settings.max_download_mb = payload.max_download_mb
     if payload.reserve_disk_mb is not None:
         settings.reserve_disk_mb = payload.reserve_disk_mb
+    if payload.traffic_reset_period is not None:
+        settings.traffic_reset_period = payload.traffic_reset_period
+    if payload.invite_required is not None:
+        settings.invite_required = payload.invite_required
+    if payload.invite_show_tip is not None:
+        settings.invite_show_tip = payload.invite_show_tip
+    if payload.invite_tip_text is not None:
+        settings.invite_tip_text = payload.invite_tip_text
+    if payload.invite_contacts is not None:
+        settings.invite_contacts = [c.model_dump() for c in payload.invite_contacts]
+    settings.normalize()  # 过滤非法联系方式/空文案
     save_settings(settings)
 
     engine = getattr(request.app.state, "engine", None)
@@ -78,6 +126,11 @@ async def update_settings(payload: SettingsPayload, request: Request) -> dict:
         engine.settings.retention_minutes = settings.retention_minutes
         engine.settings.max_download_mb = settings.max_download_mb
         engine.settings.reserve_disk_mb = settings.reserve_disk_mb
+        engine.settings.traffic_reset_period = settings.traffic_reset_period
+        engine.settings.invite_required = settings.invite_required
+        engine.settings.invite_show_tip = settings.invite_show_tip
+        engine.settings.invite_tip_text = settings.invite_tip_text
+        engine.settings.invite_contacts = [dict(c) for c in settings.invite_contacts]
         # 保留期改动即时生效：重启清扫循环（0=停掉，>0=按新值换算间隔）
         restart = getattr(engine, "on_settings_changed", None)
         if restart is not None:
@@ -86,6 +139,11 @@ async def update_settings(payload: SettingsPayload, request: Request) -> dict:
         wake = getattr(engine, "notify_disk_changed", None)
         if wake is not None:
             await wake()
+
+    # 流量周期改动即时生效（不清零，按新窗口重新判断是否到期）
+    tracker = getattr(request.app.state, "traffic", None)
+    if tracker is not None:
+        tracker.set_period(settings.traffic_reset_period)
     return _settings_view(settings)
 
 

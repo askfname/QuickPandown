@@ -17,10 +17,11 @@ from app.api.routes import router as share_router
 from app.api.settings_api import router as settings_router
 from app.api.tasks_api import router as tasks_router
 from app.auth_middleware import AuthMiddleware
-from app.config import load_settings
+from app.config import DEFAULT_TRAFFIC_RESET_PERIOD, load_settings
 from app.db import get_db_url, init_db, session_maker
 from app.engine.events import EventBus
 from app.engine.tasks import DISK_MONITOR_INTERVAL_SECONDS, TaskEngine, TaskStatus
+from app.engine.traffic import TrafficTracker
 from app.quark.client import QuarkApiError, QuarkClient
 from app.quark.errors import friendly_message
 from app.share_session import share_session
@@ -49,6 +50,13 @@ class OptionalStaticFiles(StaticFiles):
             self.config_checked = True
             return
         await super().check_config()
+
+    async def get_response(self, path: str, scope):
+        """静态资源每次协商缓存：避免升级后浏览器继续用旧 app.js/style.css"""
+        response = await super().get_response(path, scope)
+        if response.status_code == 200:
+            response.headers.setdefault("Cache-Control", "no-cache")
+        return response
 
 
 @contextlib.asynccontextmanager
@@ -108,7 +116,10 @@ async def _lifespan(app: FastAPI):
     engine.on_settings_changed = _start_sweeper  # 设置保存时换挡（间隔/开关）
     _start_sweeper()
 
-    # 磁盘监控：周期唤醒排队任务重评空间；顺带修剪过期终态任务
+    # 磁盘监控：周期唤醒排队任务重评空间；顺带修剪过期终态任务，
+    # 并把流量计数低频落盘（Tracker 内部 30 秒节流，空闲时零 I/O）
+    traffic = getattr(app.state, "traffic", None)
+
     async def disk_monitor_loop() -> None:
         while True:
             try:
@@ -118,6 +129,8 @@ async def _lifespan(app: FastAPI):
                 wake = getattr(engine, "notify_disk_changed", None)
                 if wake is not None:
                     await wake()
+                if traffic is not None:
+                    await asyncio.to_thread(traffic.flush)
             except Exception:  # noqa: BLE001 - 监控失败不阻断应用
                 pass
             await asyncio.sleep(DISK_MONITOR_INTERVAL_SECONDS)
@@ -174,6 +187,10 @@ async def _lifespan(app: FastAPI):
         disk_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await disk_task
+        # 退出前强制落盘：合并窗口内尚未写入的流量计数不丢
+        if traffic is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(traffic.flush, True)
         app.state.bus.unsubscribe(queue)
         close = getattr(getattr(app.state, "client", None), "aclose", None)
         if close is not None:
@@ -219,13 +236,30 @@ def create_app(
     if bus is None:
         bus = EventBus()
     if engine is None:
+        settings = load_settings()
+        traffic = TrafficTracker(period=settings.traffic_reset_period)
         engine = TaskEngine(
-            settings=load_settings(),
+            settings=settings,
             client_factory=lambda t: QuarkClient(cookie="", transport=transport),
             share_session=share_session,
             bus=bus,
+            traffic=traffic,
         )
+    else:
+        settings = getattr(engine, "settings", None) or load_settings()
+        traffic = getattr(engine, "traffic", None)
+        if not isinstance(traffic, TrafficTracker):
+            traffic = TrafficTracker(
+                period=getattr(
+                    settings, "traffic_reset_period", DEFAULT_TRAFFIC_RESET_PERIOD
+                )
+            )
+            try:
+                engine.traffic = traffic
+            except AttributeError:
+                pass  # 引擎替身可能只读；上传统计经 app.state 仍可用
     app.state.engine = engine
+    app.state.traffic = traffic
     app.state.bus = bus
     app.state.secret = load_or_create_secret()
 

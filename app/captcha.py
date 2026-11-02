@@ -2,7 +2,9 @@
 
 设计：无第三方依赖；验证码答案只存服务端内存（TTL 内一次性核销），
 浏览器只拿到扭曲后的 SVG（答案整串绝不明文出现在 SVG）与 HttpOnly
-Cookie 里的验证码 id。错误尝试同样核销，防基于同一 id 的枚举
+Cookie 里的验证码 id。错误尝试同样核销，防基于同一 id 的枚举。
+签发按 IP 滑动窗口限速，避免脚本无限刷新消耗 CPU、挤占内存并淘汰
+其他用户仍在有效期内的验证码
 """
 
 from __future__ import annotations
@@ -19,6 +21,13 @@ _store: dict[str, tuple[str, float]] = {}
 # 内存硬上限：验证码签发接口可被刷，超过后淘汰最早签发项
 MAX_ENTRIES = 4096
 
+# 每 IP 每分钟最多签发 30 张，
+# 脚本连刷则被 429 挡住；超过 4096 个 IP 记录后按最旧键淘汰
+ISSUE_WINDOW = 60.0
+ISSUE_MAX = 30
+ISSUE_MAX_KEYS = 4096
+_issue_hits: dict[str, list[float]] = {}
+
 
 def _monotonic() -> float:
     # 可 monkeypatch 的时钟（测试隔离用）
@@ -30,6 +39,37 @@ def _cleanup_expired() -> None:
     expired = [cid for cid, (_, exp) in _store.items() if exp < now]
     for cid in expired:
         _store.pop(cid, None)
+
+
+def _trim_oldest(table: dict, limit: int = ISSUE_MAX_KEYS) -> None:
+    while len(table) > limit:
+        table.pop(next(iter(table)), None)
+
+
+def check_issue_rate(ip: str) -> int:
+    """记录一次签发请求；超限返回需要等待的秒数，未超限返回 0。
+
+    超限时不再累加时间戳，等待窗口不会因继续请求而无限延长
+    """
+    now = _monotonic()
+    key = ip or "-"
+    hits = [t for t in _issue_hits.get(key, []) if now - t < ISSUE_WINDOW]
+    if len(hits) >= ISSUE_MAX:
+        _issue_hits[key] = hits  # 只保留窗口内的记录，键值不会无限增长
+        return max(1, int(ISSUE_WINDOW - (now - hits[0])) + 1)
+    hits.append(now)
+    _issue_hits[key] = hits
+    if len(_issue_hits) > ISSUE_MAX_KEYS:
+        # 先清过期窗口，再按最旧键淘汰；只在超限时触发，常态零成本
+        for k in [k for k, v in _issue_hits.items() if not v or now - v[-1] >= ISSUE_WINDOW]:
+            _issue_hits.pop(k, None)
+        _trim_oldest(_issue_hits)
+    return 0
+
+
+def reset_issue_rate() -> None:
+    """测试辅助：清空签发限速状态"""
+    _issue_hits.clear()
 
 
 def new_captcha() -> tuple[str, str, str]:

@@ -17,7 +17,7 @@ import time
 import zipfile
 import zlib
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator, Callable
 from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Request
@@ -33,6 +33,44 @@ TOKEN_TTL_SECONDS = 3600
 
 # 周期清扫的节拍（间隔与保留期解耦）
 SWEEP_INTERVAL_SECONDS = 600
+
+
+class CountingFileResponse(FileResponse):
+    """FileResponse 的出站字节包装：按实际发送的响应体分块累加流量。
+
+    只包一层 ``send``，不复制文件、不缓冲整包；Range 与断点行为保持不变
+    """
+
+    def __init__(self, *args: Any, on_bytes: Callable[[int], None] | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._on_bytes = on_bytes
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        callback = self._on_bytes
+        if callback is None:
+            await super().__call__(scope, receive, send)
+            return
+
+        async def counting_send(message: dict) -> None:
+            if message.get("type") == "http.response.body":
+                body = message.get("body") or b""
+                if body:
+                    callback(len(body))
+            await send(message)
+
+        await super().__call__(scope, receive, counting_send)
+
+
+def _counting_stream(stream: AsyncIterator[bytes], on_bytes: Callable[[int], None]) -> AsyncIterator[bytes]:
+    """包装任意字节流：产出前累加长度，客户端断开时自然停止计数"""
+
+    async def counted() -> AsyncIterator[bytes]:
+        async for chunk in stream:
+            if chunk:
+                on_bytes(len(chunk))
+            yield chunk
+
+    return counted()
 
 
 def load_or_create_secret() -> bytes:
@@ -214,10 +252,12 @@ def _resolve_single_download(token: str, request: Request, session: str) -> tupl
 async def download_file(token: str, request: Request, session: str = ""):
     """浏览器直接 GET 下载已完成文件；会话经 ?session= 校验归属，跨会话 404"""
     path, filename = _resolve_single_download(token, request, session)
-    return FileResponse(
+    traffic = getattr(request.app.state, "traffic", None)
+    return CountingFileResponse(
         path,
         media_type="application/octet-stream",
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
+        on_bytes=traffic.add_upload if traffic is not None else None,
     )
 
 
@@ -332,8 +372,12 @@ async def download_zip(token: str, request: Request, session: str = ""):
     headers = {
         "Content-Disposition": f"attachment; filename*=UTF-8''{quote(zip_name + '.zip')}",
     }
+    stream = _zip_stream(pairs)
+    traffic = getattr(request.app.state, "traffic", None)
+    if traffic is not None:
+        stream = _counting_stream(stream, traffic.add_upload)
     return StreamingResponse(
-        _zip_stream(pairs),
+        stream,
         media_type="application/zip",
         headers=headers,
     )

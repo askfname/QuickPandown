@@ -48,6 +48,12 @@ const STATUS_TEXT = {
   failed: "失败",
   cancelled: "已取消",
 };
+const TRAFFIC_PERIOD_TEXT = {
+  week: "每 1 星期",
+  month: "每 1 个月",
+  year: "每 1 年",
+  never: "不自动重置",
+};
 const RUNNING_STATUSES = new Set(["queued", "transferring", "downloading", "cleaning"]);
 
 const $ = (id) => document.getElementById(id);
@@ -71,6 +77,13 @@ function fmtEta(seconds) {
   if (seconds < 60) return `${Math.ceil(seconds)} 秒`;
   if (seconds < 3600) return `${Math.ceil(seconds / 60)} 分钟`;
   return `${Math.ceil(seconds / 3600)} 小时`;
+}
+
+function fmtDate(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "-";
+  const d = new Date(seconds * 1000);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
 function extOf(name) {
@@ -113,7 +126,21 @@ async function api(path, opts) {
     let detail = `HTTP ${resp.status}`;
     try {
       const body = await resp.json();
-      if (body && body.detail) detail = String(body.detail);
+      const raw = body && body.detail;
+      if (typeof raw === "string") {
+        detail = raw;
+      } else if (Array.isArray(raw)) {
+        // FastAPI 校验错误：提取可读的字段与原因，避免显示 [object Object]
+        detail = raw
+          .map((item) => {
+            const loc = Array.isArray(item && item.loc) ? item.loc.slice(1).join(".") : "";
+            const msg = String((item && item.msg) || "参数不合法");
+            return loc ? `${loc}：${msg}` : msg;
+          })
+          .join("；");
+      } else if (raw) {
+        detail = JSON.stringify(raw);
+      }
     } catch (_) { /* 非 JSON 错误体 */
     }
     throw new Error(detail);
@@ -983,16 +1010,212 @@ async function saveCookie() {
   }
 }
 
+/* ---------- 邀请码管理：注册设置 ---------- */
+const DEFAULT_INVITE_TIP =
+  "由于服务器资源有限，目前仅限邀请用户注册。你可以通过以下方式免费获取邀请码：";
+const MAX_INVITE_CONTACTS = 3;
+const INVITE_ICON_OPTIONS = [
+  ["telegram", "Telegram"],
+  ["whatsapp", "WhatsApp"],
+  ["discord", "Discord"],
+  ["qq", "QQ"],
+  ["email", "邮箱"],
+  ["link", "链接"],
+];
+
+function syncContactInputMode(icon, url, valueLabel) {
+  const isEmail = icon.value === "email";
+  url.type = isEmail ? "email" : "text";
+  url.inputMode = isEmail ? "email" : "url";
+  url.placeholder = isEmail ? "name@example.com" : "https://…";
+  if (valueLabel) valueLabel.textContent = isEmail ? "邮箱地址" : "链接";
+}
+
+function contactField(labelText, control, extraClass = "") {
+  const field = document.createElement("label");
+  field.className = `contact-field ${extraClass}`.trim();
+  const label = document.createElement("span");
+  label.className = "contact-label";
+  label.textContent = labelText;
+  field.append(label, control);
+  return { field, label };
+}
+
+function syncInviteContactAddState() {
+  const add = $("invite-contact-add");
+  if (!add) return;
+  const full = $("invite-contact-list").children.length >= MAX_INVITE_CONTACTS;
+  add.disabled = full;
+  add.title = full ? `最多添加 ${MAX_INVITE_CONTACTS} 条联系方式` : "";
+}
+
+function addInviteContactRow(contact = {}) {
+  const list = $("invite-contact-list");
+  if (list.children.length >= MAX_INVITE_CONTACTS) {
+    toast(`最多添加 ${MAX_INVITE_CONTACTS} 条联系方式`);
+    return;
+  }
+  const row = document.createElement("div");
+  row.className = "invite-contact-row";
+
+  const name = document.createElement("input");
+  name.className = "contact-name";
+  name.placeholder = "名称";
+  name.maxLength = 32;
+  name.value = contact.name || "";
+  const nameField = contactField("名称", name, "contact-field-name");
+
+  const url = document.createElement("input");
+  url.className = "contact-url";
+  url.maxLength = 500;
+  url.value = contact.url || "";
+  const urlField = contactField("链接", url, "contact-field-value");
+
+  const icon = document.createElement("select");
+  icon.className = "contact-icon";
+  INVITE_ICON_OPTIONS.forEach(([value, label]) => {
+    const opt = document.createElement("option");
+    opt.value = value;
+    opt.textContent = label;
+    icon.appendChild(opt);
+  });
+  icon.value = INVITE_ICON_OPTIONS.some(([value]) => value === contact.icon)
+    ? contact.icon
+    : "link";
+  const iconField = contactField("图标", icon, "contact-field-icon");
+  icon.addEventListener("change", () => syncContactInputMode(icon, url, urlField.label));
+  syncContactInputMode(icon, url, urlField.label);
+
+  const del = document.createElement("button");
+  del.type = "button";
+  del.className = "contact-delete";
+  del.title = "删除该联系方式";
+  del.textContent = "✕";
+  del.addEventListener("click", () => {
+    row.remove();
+    syncInviteContactAddState();
+  });
+
+  row.append(nameField.field, iconField.field, del, urlField.field);
+  list.appendChild(row);
+  syncInviteContactAddState();
+}
+
+function renderInviteContacts(contacts) {
+  const list = $("invite-contact-list");
+  list.textContent = "";
+  (Array.isArray(contacts) ? contacts : []).forEach(addInviteContactRow);
+  syncInviteContactAddState();
+}
+
+function collectInviteContacts() {
+  const out = [];
+  for (const row of $("invite-contact-list").querySelectorAll(".invite-contact-row")) {
+    const name = row.querySelector(".contact-name").value.trim();
+    const url = row.querySelector(".contact-url").value.trim();
+    const icon = row.querySelector(".contact-icon").value;
+    if (!name && !url) continue; // 空行忽略
+    if (!name) return { error: "请填写联系方式名称" };
+    if (icon === "email") {
+      if (!/^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/.test(url)) {
+        return { error: "邮箱类型需填写有效的邮箱地址" };
+      }
+    } else if (!/^https?:\/\//i.test(url)) {
+      return { error: "联系方式链接需以 http:// 或 https:// 开头" };
+    }
+    out.push({ name, url, icon });
+  }
+  if (out.length > MAX_INVITE_CONTACTS) {
+    return { error: `最多添加 ${MAX_INVITE_CONTACTS} 条联系方式` };
+  }
+  return { contacts: out };
+}
+
+function hasInviteSettings(body) {
+  return (
+    body &&
+    typeof body === "object" &&
+    "invite_required" in body &&
+    "invite_show_tip" in body &&
+    "invite_tip_text" in body &&
+    Array.isArray(body.invite_contacts)
+  );
+}
+
+function applyInviteSettings(body) {
+  $("invite-required").checked = body.invite_required !== false;
+  $("invite-show-tip").checked = body.invite_show_tip !== false;
+  // 默认文案，输入框留空即使用默认值
+  $("invite-tip-input").value =
+    body.invite_tip_text && body.invite_tip_text !== DEFAULT_INVITE_TIP
+      ? body.invite_tip_text
+      : "";
+  renderInviteContacts(body.invite_contacts);
+}
+
+const STALE_SETTINGS_MESSAGE =
+  "服务端未返回注册设置，请更新并重启服务端后刷新页面";
+
+async function loadInviteSettings() {
+  const body = await api("/api/settings", { cache: "no-store" });
+  const msg = $("invite-settings-message");
+  if (!hasInviteSettings(body)) {
+    // 旧版服务端会忽略 invite_* 字段：明确提示，避免误以为设置被重置
+    msg.textContent = STALE_SETTINGS_MESSAGE;
+    throw new Error(STALE_SETTINGS_MESSAGE);
+  }
+  applyInviteSettings(body);
+  msg.textContent = "";
+}
+
+async function saveInviteSettings() {
+  const msg = $("invite-settings-message");
+  const tip = $("invite-tip-input").value.trim();
+  if (tip.length > 500) {
+    msg.textContent = "提示内容不能超过 500 字";
+    return;
+  }
+  const contacts = collectInviteContacts();
+  if (contacts.error) {
+    msg.textContent = contacts.error;
+    return;
+  }
+  $("invite-settings-save").disabled = true;
+  msg.textContent = "保存中…";
+  try {
+    const saved = await postJSON("/api/settings", {
+      invite_required: $("invite-required").checked,
+      invite_show_tip: $("invite-show-tip").checked,
+      invite_tip_text: tip,
+      invite_contacts: contacts.contacts,
+    });
+    if (!hasInviteSettings(saved)) {
+      throw new Error(STALE_SETTINGS_MESSAGE);
+    }
+    // 回填服务端实际保存结果：空文案会规范化为默认提示
+    applyInviteSettings(saved);
+    msg.textContent = "已保存";
+    toast("注册设置已保存");
+  } catch (err) {
+    msg.textContent = `保存失败：${err.message}`;
+    toast(`注册设置保存失败：${err.message}`);
+  } finally {
+    $("invite-settings-save").disabled = false;
+  }
+}
+
 /* ---------- 设置 ---------- */
 async function openSettings() {
   try {
-    const body = await api("/api/settings");
+    const body = await api("/api/settings", { cache: "no-store" });
     $("setting-download-dir").value = body.download_dir || "";
     $("setting-concurrency").value = String(body.concurrency || 2);
     $("setting-retention").value = String(body.retention_minutes || 60);
     $("setting-max-download").value = String(body.max_download_mb ?? 0);
     $("setting-reserve-disk").value = String(body.reserve_disk_mb ?? 1024);
+    $("setting-traffic-period").value = body.traffic_reset_period || "month";
     $("settings-message").textContent = "";
+    await refreshTraffic(); // 统计范围随时打开设置都是最新的
     openModal("settings-modal");
   } catch (err) {
     toast(`读取设置失败：${err.message}`);
@@ -1021,6 +1244,11 @@ async function saveSettings() {
     msg.textContent = "保留时长需为正整数分钟（「不保留」选项已移除）";
     return;
   }
+  const trafficPeriod = $("setting-traffic-period").value;
+  if (!["week", "month", "year", "never"].includes(trafficPeriod)) {
+    msg.textContent = "流量重置周期无效";
+    return;
+  }
   $("settings-save").disabled = true;
   try {
     await postJSON("/api/settings", {
@@ -1029,11 +1257,13 @@ async function saveSettings() {
       retention_minutes: retention,
       max_download_mb: maxDownload,
       reserve_disk_mb: reserveDisk,
+      traffic_reset_period: trafficPeriod,
     });
     msg.textContent = "";
     closeModal("settings-modal");
     toast("设置已保存");
     refreshDiskStats(); // 预留值变化后立即刷新管理员磁盘提示
+    refreshTraffic(); // 周期变化后立即刷新统计范围
   } catch (err) {
     msg.textContent = `保存失败：${err.message}`;
   } finally {
@@ -1078,11 +1308,12 @@ async function loadAdminPanel() {
   if (invBtn) invBtn.classList.remove("hidden");
   const settingsBtn = $("settings-btn");
   if (settingsBtn) settingsBtn.classList.remove("hidden");
-  await Promise.all([refreshOnlineStats(), refreshDiskStats()]);
-  // 在线统计与磁盘用量 30 秒轮询
+  await Promise.all([refreshOnlineStats(), refreshDiskStats(), refreshTraffic()]);
+  // 在线统计、流量与磁盘用量 30 秒轮询
   setInterval(() => {
     refreshOnlineStats();
     refreshDiskStats();
+    refreshTraffic();
   }, 30000);
 }
 
@@ -1137,6 +1368,64 @@ async function addInvites() {
   }
 }
 
+async function copyToClipboard(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (_) { /* 权限被拒时走兼容回退 */ }
+  }
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.setAttribute("readonly", "");
+  area.style.position = "fixed";
+  area.style.opacity = "0";
+  document.body.appendChild(area);
+  area.select();
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } catch (_) {
+    ok = false;
+  }
+  area.remove();
+  return ok;
+}
+
+async function generateInvites() {
+  const input = $("invite-generate-count");
+  const btn = $("invite-generate");
+  const count = Number(input.value);
+  if (!Number.isInteger(count) || count < 1 || count > 200) {
+    toast("生成数量需为 1–200 的整数");
+    input.focus();
+    return;
+  }
+  btn.disabled = true;
+  const label = btn.textContent;
+  btn.textContent = "生成中…";
+  try {
+    const body = await api("/api/admin/invites/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ count }),
+    });
+    const codes = body.codes || [];
+    const copied = await copyToClipboard(codes.join("\n"));
+    await refreshInvites();
+    toast(
+      copied
+        ? `已生成 ${codes.length} 个邀请码，已复制到剪贴板`
+        : `已生成 ${codes.length} 个邀请码，复制失败，请手动复制`
+    );
+  } catch (err) {
+    toast(`生成失败：${err.message}`);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+  }
+}
+
 async function deleteInvites(codes) {
   try {
     const body = await api("/api/admin/invites", {
@@ -1160,13 +1449,48 @@ async function refreshOnlineStats() {
 }
 
 async function refreshDiskStats() {
-  // 仅管理员面板调用：已用/剩余空间与空间不足警告横幅
+  // 仅管理员面板调用：三段式磁盘用量条 + 空间不足警告横幅
   try {
     const body = await api("/api/admin/disk");
-    $("stat-disk-used").textContent = fmtSize(body.used_bytes || 0);
-    $("stat-disk-free").textContent = fmtSize(body.free_bytes || 0);
-    const box = $("disk-free-box");
-    if (box) box.classList.toggle("disk-low", !!body.low);
+    const total = Math.max(0, Number(body.total_bytes) || 0);
+    const used = Math.max(0, Number(body.used_bytes) || 0);
+    const free = Math.max(0, Number(body.free_bytes) || 0);
+    // 预留值包含在 free 里：长条用「已用 | 剩余可用 | 预留」三段拼满总容量
+    const reserve = Math.min(free, Math.max(0, Number(body.reserve_bytes) || 0));
+    const usable = Math.max(0, free - reserve);
+    const pct = (n) => (total > 0 ? Math.min(100, (n / total) * 100) : 0);
+
+    const segments = [
+      ["disk-seg-used", used],
+      ["disk-seg-free", usable],
+      ["disk-seg-reserve", reserve],
+    ];
+    segments.forEach(([id, value]) => {
+      const el = $(id);
+      if (el) {
+        el.style.width = `${pct(value)}%`;
+        el.title = fmtSize(value);
+      }
+    });
+
+    const setText = (id, value) => {
+      const el = $(id);
+      if (el) el.textContent = fmtSize(value);
+    };
+    setText("stat-disk-used", used);
+    setText("stat-disk-free", usable);
+    setText("stat-disk-reserve", reserve);
+
+    const summary = $("disk-summary");
+    const summaryText = total > 0
+      ? `总容量 ${fmtSize(total)} · 可用 ${fmtSize(usable)}`
+      : "暂无法读取磁盘信息";
+    if (summary) summary.textContent = summaryText;
+    const bar = $("disk-bar");
+    if (bar) bar.setAttribute("aria-label", `磁盘用量：${summaryText}`);
+    const usage = $("disk-usage");
+    if (usage) usage.classList.toggle("low", !!body.low);
+
     const hint = $("disk-hint");
     if (!hint) return;
     if (!body.low) {
@@ -1182,15 +1506,58 @@ async function refreshDiskStats() {
   } catch (_) { /* 磁盘统计失败不打扰 */ }
 }
 
+async function refreshTraffic() {
+  try {
+    renderTraffic(await api("/api/admin/traffic"));
+  } catch (_) { /* 流量统计失败不打扰 */ }
+}
+
+function renderTraffic(body) {
+  const upload = Math.max(0, Number(body.upload_bytes) || 0);
+  const download = Math.max(0, Number(body.download_bytes) || 0);
+  const up = $("stat-upload");
+  if (up) up.textContent = fmtSize(upload);
+  const down = $("stat-download");
+  if (down) down.textContent = fmtSize(download);
+
+  const range = $("traffic-range");
+  if (!range) return;
+  const started = fmtDate(Number(body.started_at));
+  const next = Number(body.next_reset_at);
+  const period = TRAFFIC_PERIOD_TEXT[body.period] || "自定义周期";
+  range.textContent = next
+    ? `本期自 ${started} · ${fmtDate(next)} 自动重置`
+    : `本期自 ${started} · 不自动重置`;
+  range.title = `统计周期：${period}`;
+}
+
+async function resetTraffic() {
+  if (!window.confirm("确定清零本期上传/下载流量统计？")) return;
+  const quick = $("traffic-quick-reset");
+  if (quick) quick.disabled = true;
+  try {
+    renderTraffic(await postJSON("/api/admin/traffic/reset", {}));
+    toast("流量统计已重置");
+  } catch (err) {
+    toast(`重置失败：${err.message}`);
+  } finally {
+    if (quick) quick.disabled = false;
+  }
+}
+
 function dismissDiskAlert() {
   diskAlertDismissed = true;
   $("disk-hint").classList.add("hidden");
 }
 
 async function openInvitesModal() {
-  // 邀请码管理常驻弹窗入口：点击才拉取并渲染列表（主页不挂长列表）
+  // 点击才拉取注册设置与邀请码列表（主页不挂长列表）
   openModal("invites-modal");
-  await refreshInvites();
+  try {
+    await Promise.all([loadInviteSettings(), refreshInvites()]);
+  } catch (err) {
+    toast(`读取邀请设置失败：${err.message}`);
+  }
 }
 
 async function logoutAndGo() {
@@ -1212,6 +1579,12 @@ async function init() {
   // 身份展示 + 登出
   const whoami = $("whoami");
   if (whoami) whoami.textContent = `${store.me.username}${store.me.role === "admin" ? "（管理员）" : ""}`;
+  // 赞助条仅普通用户可见：管理员不展示赞助入口
+  const sponsorBar = $("sponsor-bar");
+  if (sponsorBar) {
+    if (store.me.role === "admin") sponsorBar.remove();
+    else sponsorBar.classList.remove("hidden");
+  }
   const logoutBtn = $("logout-btn");
   if (logoutBtn) logoutBtn.addEventListener("click", logoutAndGo);
 
@@ -1232,10 +1605,17 @@ async function init() {
   $("settings-btn").addEventListener("click", openSettings);
   $("cookie-save").addEventListener("click", saveCookie);
   $("settings-save").addEventListener("click", saveSettings);
+  $("invite-contact-add").addEventListener("click", () => addInviteContactRow());
+  $("invite-settings-save").addEventListener("click", saveInviteSettings);
+  $("traffic-quick-reset").addEventListener("click", resetTraffic);
   initModals();
 
   // 管理面板 + 邀请码弹窗入口（普通用户节点会被移除）
   $("invite-add").addEventListener("click", addInvites);
+  $("invite-generate").addEventListener("click", generateInvites);
+  $("invite-generate-count").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") generateInvites();
+  });
   $("invites-btn").addEventListener("click", openInvitesModal);
   $("disk-hint-close").addEventListener("click", dismissDiskAlert);
   await loadAdminPanel();

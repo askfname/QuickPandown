@@ -110,8 +110,10 @@ class TaskEngine:
         bus: Any,
         cookie_getter: Callable[[], str] | None = None,
         db_path: Path | None = None,
+        traffic: Any = None,
     ) -> None:
         self.settings = settings
+        self.traffic = traffic  # 流量计数器（可空：单测/嵌入场景不统计）
         self._client_factory = client_factory
         self._share_session = share_session
         self._bus = bus
@@ -715,6 +717,10 @@ class TaskEngine:
         """Semaphore 限流并发下载；子项失败不中断其他子项，取消经 cancel_flag 协作传播"""
         semaphore = asyncio.Semaphore(self.settings.concurrency)
         http = httpx.AsyncClient()
+        traffic = getattr(self, "traffic", None)
+        extra: dict[str, Any] = {}
+        if traffic is not None:
+            extra["on_bytes"] = traffic.add_download
         try:
 
             async def worker(sub: SubItem) -> None:
@@ -735,6 +741,7 @@ class TaskEngine:
                             dest,
                             on_progress=lambda done, total: self._progress(task, sub, done, total),
                             cancel_flag=flag,
+                            **extra,
                         )
                     except asyncio.CancelledError:
                         sub.status = "cancelled"

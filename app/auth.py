@@ -1,4 +1,4 @@
-"""认证服务：密码哈希、注册（邀请码一次性）、登录限速、会话生命周期"""
+"""认证服务：密码哈希、注册（邀请码可开关、一次性核销）、登录限速、会话生命周期"""
 
 from __future__ import annotations
 
@@ -90,7 +90,9 @@ async def verify_password_async(password: str, password_hash: str) -> bool:
     return await asyncio.to_thread(verify_password, password, password_hash)
 
 
-def validate_register(username: str, email: str, password: str, invite_code: str) -> str | None:
+def validate_register(
+    username: str, email: str, password: str, invite_code: str, invite_required: bool = True
+) -> str | None:
     """注册字段静态校验；返回错误消息，None 表示通过"""
     if not USERNAME_RE.match(username or ""):
         return "用户名需为 3-32 位字母、数字、下划线或中划线"
@@ -102,7 +104,7 @@ def validate_register(username: str, email: str, password: str, invite_code: str
         return "仅支持常用邮箱（gmail / outlook / qq / foxmail / 163 / 126 等）"
     if not password or len(password) < 8:
         return "密码至少 8 位"
-    if not (invite_code or "").strip():
+    if invite_required and not (invite_code or "").strip():
         return "邀请码必填"
     return None
 
@@ -165,20 +167,29 @@ def _clear_fail(key: tuple[str, str]) -> None:
 _DUMMY_HASH = _hasher.hash("timing-equalizer-dummy")
 
 
-async def register(db_maker, username: str, email: str, password: str, invite_code: str, ip: str = "") -> User:
+async def register(
+    db_maker,
+    username: str,
+    email: str,
+    password: str,
+    invite_code: str,
+    ip: str = "",
+    invite_required: bool = True,
+) -> User:
     """邀请码注册：事务内原子核销邀请码；无效/已用/重复用户名抛 AuthError"""
     _check_rate(ip)  # 注册与登录共享每 IP 限速，防邀请码爆破
     code = (invite_code or "").strip()
     async with db_maker() as db:
-        # 原子占用邀请码：条件 UPDATE（used_by IS NULL 才写入），并发安全
-        result = await db.execute(
-            sa_update(InviteCode)
-            .where(InviteCode.code == code, InviteCode.used_by.is_(None))
-            .values(used_by=-1, used_at=datetime.now())  # -1 = 占位，注册成功后回填
-        )
-        if result.rowcount == 0:
-            # 统一文案：不区分"无效"与"已用"，防邀请码枚举 oracle
-            raise AuthError("邀请码无效或已被使用")
+        if invite_required:
+            # 原子占用邀请码：条件 UPDATE（used_by IS NULL 才写入），并发安全
+            result = await db.execute(
+                sa_update(InviteCode)
+                .where(InviteCode.code == code, InviteCode.used_by.is_(None))
+                .values(used_by=-1, used_at=datetime.now())  # -1 = 占位，注册成功后回填
+            )
+            if result.rowcount == 0:
+                # 统一文案：不区分"无效"与"已用"，防邀请码枚举 oracle
+                raise AuthError("邀请码无效或已被使用")
         dup = (await db.execute(select(User).where(User.username == username))).scalar_one_or_none()
         if dup is not None:
             await db.rollback()
@@ -191,9 +202,10 @@ async def register(db_maker, username: str, email: str, password: str, invite_co
         )
         db.add(user)
         await db.flush()
-        await db.execute(
-            sa_update(InviteCode).where(InviteCode.code == code).values(used_by=user.id)
-        )
+        if invite_required:
+            await db.execute(
+                sa_update(InviteCode).where(InviteCode.code == code).values(used_by=user.id)
+            )
         await db.commit()
         return user
 

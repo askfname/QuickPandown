@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import secrets
+import time
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
+from app.config import DEFAULT_TRAFFIC_RESET_PERIOD, load_settings
 from app.db import InviteCode
 
 router = APIRouter(prefix="/api/admin")
@@ -17,8 +22,52 @@ def _db_maker(request: Request) -> Any:
     return request.app.state.db_maker
 
 
+# 自动生成邀请码：去掉 0/O、1/I/L 等易混淆字符，按 4-4 分组便于人工转述
+INVITE_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+INVITE_CODE_RANDOM_LEN = 8
+MAX_GENERATE_INVITES = 200
+
+
 class InvitesPayload(BaseModel):
     codes: list[str] = Field(min_length=1, max_length=200)
+
+
+class GenerateInvitesPayload(BaseModel):
+    count: int = Field(ge=1, le=MAX_GENERATE_INVITES)
+
+
+def _new_invite_code() -> str:
+    raw = "".join(
+        secrets.choice(INVITE_CODE_ALPHABET) for _ in range(INVITE_CODE_RANDOM_LEN)
+    )
+    return f"QP-{raw[:4]}-{raw[4:]}"
+
+
+@router.post("/invites/generate")
+async def generate_invites(payload: GenerateInvitesPayload, request: Request) -> dict:
+    """按数量自动生成邀请码：服务端安全随机、去重后落库并返回明文"""
+    user = request.state.user
+    codes: list[str] = []
+    async with _db_maker(request)() as db:
+        existing = set(
+            (await db.execute(select(InviteCode.code))).scalars()
+        )
+        while len(codes) < payload.count:
+            code = _new_invite_code()
+            if code in existing:
+                continue
+            existing.add(code)
+            codes.append(code)
+        for code in codes:
+            db.add(InviteCode(code=code, created_by=user.id))
+        try:
+            await db.commit()
+        except IntegrityError as exc:
+            # 并发生成撞上唯一索引时回滚，让管理员重试即可
+            await db.rollback()
+            raise HTTPException(status_code=409, detail="邀请码生成冲突，请重试") from exc
+    return {"ok": True, "count": len(codes), "codes": codes}
+
 
 
 @router.get("/invites")
@@ -119,7 +168,7 @@ async def disk_space(request: Request) -> dict:
     # 引擎替身（测试/嵌入场景）兜底：按当前设置探测下载卷
     from pathlib import Path
 
-    from app.config import load_settings, project_root
+    from app.config import project_root
     from app.engine.disk import disk_snapshot
 
     settings = getattr(engine, "settings", None) or load_settings()
@@ -134,3 +183,39 @@ async def disk_space(request: Request) -> dict:
             "reserve_bytes": int(settings.reserve_disk_mb or 0) * 1024 * 1024,
             "inflight_bytes": 0, "available_bytes": 0, "low": False,
         }
+
+
+def _traffic_view(request: Request) -> dict:
+    """流量统计快照；引擎替身/嵌入场景无计数器时返回零值，不报错"""
+    tracker = getattr(request.app.state, "traffic", None)
+    if tracker is not None:
+        return tracker.snapshot()
+
+    engine = getattr(request.app.state, "engine", None)
+    settings = getattr(engine, "settings", None) or load_settings()
+    now = time.time()
+    return {
+        "download_bytes": 0,
+        "upload_bytes": 0,
+        "total_bytes": 0,
+        "period": getattr(settings, "traffic_reset_period", DEFAULT_TRAFFIC_RESET_PERIOD),
+        "started_at": now,
+        "next_reset_at": None,
+        "updated_at": now,
+    }
+
+
+@router.get("/traffic")
+async def traffic_stats(request: Request) -> dict:
+    """管理员流量统计：上传（服务器→浏览器）与下载（夸克→服务器）文件字节"""
+    return _traffic_view(request)
+
+
+@router.post("/traffic/reset")
+async def reset_traffic(request: Request) -> dict:
+    """立即清零流量统计并开启新周期"""
+    tracker = getattr(request.app.state, "traffic", None)
+    if tracker is None:
+        return _traffic_view(request)
+    # 原子写盘很小，但放线程避免在事件循环里做文件 I/O
+    return await asyncio.to_thread(tracker.reset)

@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from app.auth import AuthError, validate_register
+from app.config import load_settings, registration_policy
 
 router = APIRouter(prefix="/api/auth")
 
@@ -39,7 +40,7 @@ class RegisterPayload(BaseModel):
     username: str
     email: str
     password: str
-    invite_code: str = Field(alias="inviteCode")
+    invite_code: str = Field(default="", alias="inviteCode")
     captcha: str
 
     model_config = {"populate_by_name": True}
@@ -52,10 +53,17 @@ class LoginPayload(BaseModel):
 
 
 @router.get("/captcha")
-async def captcha_image() -> Response:
+async def captcha_image(request: Request) -> Response:
     """签发验证码 SVG；id 放 HttpOnly Cookie（qp_cap），答案仅服务端留存"""
     from app import captcha
 
+    retry_after = captcha.check_issue_rate(_ip(request))
+    if retry_after:
+        raise HTTPException(
+            status_code=429,
+            detail="验证码刷新过于频繁，请稍后再试",
+            headers={"Retry-After": str(retry_after)},
+        )
     cid, svg, _answer = captcha.new_captcha()
     resp = Response(svg, media_type="image/svg+xml")
     resp.headers["Cache-Control"] = "no-store"
@@ -74,20 +82,32 @@ def _check_captcha(request: Request, answer: str) -> None:
         raise HTTPException(status_code=400, detail="验证码错误或已过期")
 
 
+@router.get("/registration-policy")
+async def get_registration_policy() -> dict:
+    """登录页公开策略：是否需要邀请码、提示文案与联系方式"""
+    return registration_policy()
+
+
 @router.post("/register")
 async def register(payload: RegisterPayload, request: Request, response: Response) -> dict:
+    settings = load_settings()
     _check_captcha(request, payload.captcha)
-    err = validate_register(payload.username, payload.email, payload.password, payload.invite_code)
+    err = validate_register(
+        payload.username, payload.email, payload.password,
+        payload.invite_code, invite_required=settings.invite_required,
+    )
     if err:
         raise HTTPException(status_code=400, detail=err)
     from app.auth import register as do_register
 
     try:
-        user = await do_register(_db_maker(request), payload.username, payload.email,
-                                 payload.password, payload.invite_code, ip=_ip(request))
+        user = await do_register(
+            _db_maker(request), payload.username, payload.email, payload.password,
+            payload.invite_code, ip=_ip(request), invite_required=settings.invite_required,
+        )
     except AuthError as exc:
         raise HTTPException(status_code=400, detail=exc.message) from exc
-    # 注册即登录：签发会话 Cookie（已过邀请码+验证码双验证，无二次验证尴尬）
+    # 注册即登录：签发会话 Cookie（验证码已通过）
     from app.auth import issue_session
 
     sess = await issue_session(_db_maker(request), user.id)

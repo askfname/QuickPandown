@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass, fields
+import re
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Optional
 
@@ -19,6 +20,50 @@ DATA_DIR = project_root() / "data"
 # 本地文件保留上限（7 天）：与 tasks.json 历史保留期对齐；历史在文件到期
 # 后还会再保留一个周期，清扫器不会因历史先过期而失去文件记录
 MAX_RETENTION_MINUTES = 7 * 24 * 60
+
+# 流量统计自动归零周期：week/month/year 按固定时长计（7/30/365 天），
+# never 表示只由管理员手动重置
+TRAFFIC_RESET_PERIODS = ("week", "month", "year", "never")
+DEFAULT_TRAFFIC_RESET_PERIOD = "month"
+
+# 注册页邀请提示与联系方式（联系方式 icon 仅取预置值，前端内置图标）
+DEFAULT_INVITE_TIP = (
+    "由于服务器资源有限，目前仅限邀请用户注册。你可以通过以下方式免费获取邀请码："
+)
+INVITE_ICONS = ("telegram", "qq", "whatsapp", "discord", "email", "link")
+MAX_INVITE_CONTACTS = 3
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+DEFAULT_INVITE_CONTACTS = [
+    {"name": "Telegram", "url": "https://t.me/playlab_group", "icon": "telegram"},
+    {"name": "QQ 群", "url": "https://qm.qq.com/q/YpmXsCME8i", "icon": "qq"},
+]
+
+
+def is_valid_contact_value(icon: str, value: str) -> bool:
+    """邮箱图标填邮箱地址，其余图标填 http(s) 链接"""
+    value = (value or "").strip()
+    if icon == "email":
+        return bool(EMAIL_RE.match(value))
+    return value.lower().startswith(("http://", "https://"))
+
+
+def normalize_contacts(items: Any) -> list[dict[str, str]]:
+    """过滤非法联系方式：预置图标、最多 MAX_INVITE_CONTACTS 条"""
+    if not isinstance(items, list):
+        return [dict(c) for c in DEFAULT_INVITE_CONTACTS]
+    out: list[dict[str, str]] = []
+    for item in items[:MAX_INVITE_CONTACTS]:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()[:32]
+        url = str(item.get("url") or "").strip()[:500]
+        icon = str(item.get("icon") or "link").strip()
+        if icon not in INVITE_ICONS:
+            icon = "link"
+        if not name or not is_valid_contact_value(icon, url):
+            continue
+        out.append({"name": name, "url": url, "icon": icon})
+    return out
 
 
 @dataclass
@@ -35,6 +80,15 @@ class Settings:
     max_download_mb: int = 0
     # 磁盘预留空间（MB）：可用空间低于该值时，新下载任务排队等待；0=关闭守门
     reserve_disk_mb: int = 1024
+    # 上传/下载流量统计的重置周期：week | month | year | never
+    traffic_reset_period: str = DEFAULT_TRAFFIC_RESET_PERIOD
+    # 注册策略：默认关闭邀请码注册（部署后可直接注册，管理员手动开启）
+    invite_required: bool = False
+    invite_show_tip: bool = True
+    invite_tip_text: str = DEFAULT_INVITE_TIP
+    invite_contacts: list[dict[str, str]] = field(
+        default_factory=lambda: [dict(c) for c in DEFAULT_INVITE_CONTACTS]
+    )
 
     def normalize(self) -> None:
         """负数上限/预留空间按不限制或关闭守门处理；保留期封顶历史保留期。"""
@@ -44,6 +98,10 @@ class Settings:
             self.reserve_disk_mb = 0
         if self.retention_minutes > MAX_RETENTION_MINUTES:
             self.retention_minutes = MAX_RETENTION_MINUTES
+        if self.traffic_reset_period not in TRAFFIC_RESET_PERIODS:
+            self.traffic_reset_period = DEFAULT_TRAFFIC_RESET_PERIOD
+        self.invite_tip_text = (self.invite_tip_text or DEFAULT_INVITE_TIP).strip()[:500]
+        self.invite_contacts = normalize_contacts(self.invite_contacts)
 
 
 def _settings_path() -> Path:
@@ -104,3 +162,14 @@ def load_settings() -> Settings:
 def save_settings(s: Settings) -> None:
     """将设置写入 data/settings.json"""
     _write_json(_settings_path(), asdict(s))
+
+
+def registration_policy(s: Settings | None = None) -> dict:
+    """注册页可见的公开策略，不含其他服务器设置"""
+    s = s or load_settings()
+    return {
+        "invite_required": s.invite_required,
+        "show_tip": s.invite_show_tip,
+        "tip_text": s.invite_tip_text,
+        "contacts": [dict(c) for c in s.invite_contacts],
+    }
